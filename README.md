@@ -61,21 +61,37 @@ val: /path/to/dataset/val/images
 ### 2. Train
 
 ```bash
-# Default 640×640 resolution
+# Default 640×640 resolution with YOLOv5-style LR scheduling
 python train.py dataset.yaml
 
 # Custom resolution (must be divisible by 32)
 python train.py dataset.yaml --img-size 512   # Faster, lower memory
 python train.py dataset.yaml --img-size 1280  # Higher accuracy, more memory
+
+# Customize learning rate schedule
+python train.py dataset.yaml --lr 0.02          # Higher initial LR
+python train.py dataset.yaml --min-lr 0.0001    # Minimum LR at end
+python train.py dataset.yaml --warmup-epochs 5  # Longer warmup
+python train.py dataset.yaml --epochs 50        # Shorter training
+
+# Combined options
+python train.py dataset.yaml --img-size 1024 --lr 0.015 --epochs 150
 ```
 
-Training runs for 100 epochs and saves the model as `yolo_YYYYMMDD_HHMMSS.pt`.
+**Learning Rate Schedule (YOLOv5-style):**
+- **Warmup**: Linear ramp from 1e-6 → 0.01 over 3 epochs (prevents early instability)
+- **Cosine Annealing**: Smooth decay from 0.01 → 0.0001 over remaining epochs
+- **Gradient Clipping**: max_norm=10.0 to prevent exploding gradients
+- **10× higher peak LR** than previous fixed-rate implementation for faster convergence
+
+Training runs for 100 epochs by default and saves the model as `yolo_YYYYMMDD_HHMMSS.pt`.
 The checkpoint includes img_size, so it will be loaded automatically during inference/evaluation.
 
 **Training output:**
 ```
-Epoch 1: Loss: 12.3456 (bbox: 2.34, obj: 8.90, cls: 1.11) | Val: Loss 11.23, P 45.2%, R 38.7%, F1 41.7%
-Epoch 2: Loss: 10.2345 (bbox: 1.89, obj: 7.45, cls: 0.90) | Val: Loss 9.87, P 52.3%, R 46.8%, F1 49.4%
+Epoch 1: Loss: 12.3456 (bbox: 2.34, obj: 8.90, cls: 1.11) | Val: Loss 11.23, P 45.2%, R 38.7%, F1 41.7% | LR: 0.000001
+Epoch 2: Loss: 10.2345 (bbox: 1.89, obj: 7.45, cls: 0.90) | Val: Loss 9.87, P 52.3%, R 46.8%, F1 49.4% | LR: 0.003334
+Epoch 4: Loss: 8.1234 (bbox: 1.45, obj: 5.89, cls: 0.78) | Val: Loss 8.12, P 61.7%, R 54.2%, F1 57.7% | LR: 0.010000
 ...
 ```
 
@@ -310,7 +326,8 @@ yolo-from-scratch/
 - `ciou_loss`: Complete IoU loss function
 - `yolo_loss`: Single-scale composite loss function
 - `yolo_loss_multiscale`: Multi-scale loss aggregation
-- `train_epoch`: Training loop with multi-scale support
+- `get_lr_lambda`: Learning rate scheduler (warmup + cosine annealing)
+- `train_epoch`: Training loop with multi-scale support and gradient clipping
 - `eval_epoch`: Evaluation with multi-scale metrics
 - `predict`: Multi-scale inference with global NMS
 - CLI interface for all operations
@@ -322,6 +339,8 @@ yolo-from-scratch/
 ✅ **Multi-scale Detection**: FPN + PANet neck with 3 detection heads (P3/P4/P5)
 ✅ **C3 Modules**: CSP Bottleneck with residual connections for feature fusion
 ✅ **Scale-specific Anchors**: 9 anchors total (3 per scale: small/medium/large)
+✅ **Learning Rate Scheduling**: Warmup + cosine annealing for faster convergence
+✅ **Gradient Clipping**: Prevents exploding gradients during training
 ✅ **SPPF Module**: Spatial Pyramid Pooling - Fast (2× faster than SPP)
 ✅ **SiLU Activation**: YOLOv5's standard activation function
 ✅ **Offset Prediction**: YOLOv5-style encoded predictions with decoding
@@ -338,7 +357,7 @@ yolo-from-scratch/
 
 ❌ Full CSPDarknet53 backbone (uses simpler 5-layer backbone with C3 modules)
 ❌ Data augmentation (Mosaic, MixUp, HSV)
-❌ Advanced training (warmup, cosine LR, label smoothing)
+❌ Label smoothing
 ❌ True COCO-style mAP evaluation (uses grid-based precision/recall)
 ❌ Automatic anchor optimization (k-means clustering)
 ❌ Mixed precision training (FP16/AMP)
@@ -364,7 +383,7 @@ yolo-from-scratch/
 
 ## Tips for Best Results
 
-1. **Start with default 640×640**: Good balance between speed and accuracy for most tasks
+1. **Start with default settings**: 640×640 resolution with default LR schedule (lr=0.01, warmup=3) works well for most tasks
 2. **Adjust resolution based on object sizes**:
    - **Small objects (<32px)**: Use 1024×1024 or 1280×1280 (P3 head shines here)
    - **Mixed sizes**: Use 640×640 (all 3 heads contribute)
@@ -373,12 +392,17 @@ yolo-from-scratch/
    - P3 (stride 8) detects objects <50px very well
    - P4 (stride 16) handles 50-150px objects
    - P5 (stride 32) best for objects >150px
-4. **Balance your dataset**: Ensure roughly equal numbers of examples per class
-5. **Monitor F1 score**: Best indicator of overall detection quality across all scales
-6. **Adjust confidence threshold**: Lower for more detections, higher for fewer false positives
-7. **Check with eval.py**: Visually inspect predictions to diagnose which scales are working
-8. **Train longer**: 100 epochs may not be enough for complex datasets (FPN has 4× more parameters)
-9. **GPU memory**: FPN requires ~2× more VRAM than single-scale; reduce batch size if OOM occurs
+4. **Tune learning rate if needed**:
+   - **Slow convergence**: Increase `--lr 0.02` (but may require longer warmup)
+   - **Loss spikes/NaN**: Decrease `--lr 0.005` or increase `--warmup-epochs 5`
+   - **Monitor LR**: Watch the logged LR values to ensure proper scheduling
+   - **Fine-tuning**: Start with higher `--min-lr 0.001` for transfer learning
+5. **Balance your dataset**: Ensure roughly equal numbers of examples per class
+6. **Monitor F1 score**: Best indicator of overall detection quality across all scales
+7. **Adjust confidence threshold**: Lower for more detections, higher for fewer false positives
+8. **Check with eval.py**: Visually inspect predictions to diagnose which scales are working
+9. **Train longer if needed**: 100 epochs may not be enough for complex datasets (FPN has 4× more parameters)
+10. **GPU memory**: FPN requires ~2× more VRAM than single-scale; reduce batch size if OOM occurs
 
 ## Troubleshooting
 

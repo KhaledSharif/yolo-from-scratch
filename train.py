@@ -669,6 +669,10 @@ def train_epoch(model, loader, optimizer, device, num_classes=1):
         )
 
         loss.backward()
+
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+
         optimizer.step()
 
         total_loss += loss.item()
@@ -786,6 +790,36 @@ def eval_epoch(model, loader, device, num_classes=1, iou_threshold=0.5, conf_thr
 
     avg_loss = total_loss / len(loader)
     return avg_loss, precision * 100, recall * 100, f1 * 100
+
+def get_lr_lambda(warmup_epochs=3, total_epochs=100, initial_lr=1e-2, min_lr=1e-4, warmup_start_lr=1e-6):
+    """
+    Create a learning rate scheduler function with warmup + cosine annealing.
+
+    YOLOv5-style learning rate schedule:
+    1. Linear warmup: Gradually increase LR from warmup_start_lr to initial_lr over warmup_epochs
+    2. Cosine annealing: Smoothly decay LR from initial_lr to min_lr using cosine curve
+
+    Args:
+        warmup_epochs: Number of epochs for warmup phase (default 3)
+        total_epochs: Total training epochs (default 100)
+        initial_lr: Peak learning rate after warmup (default 1e-2)
+        min_lr: Minimum learning rate at end of training (default 1e-4)
+        warmup_start_lr: Starting learning rate for warmup (default 1e-6)
+
+    Returns:
+        Lambda function that takes epoch number and returns LR multiplier
+    """
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup: scale from warmup_start_lr to initial_lr
+            return (warmup_start_lr + (initial_lr - warmup_start_lr) * epoch / warmup_epochs) / initial_lr
+        else:
+            # Cosine annealing: smoothly decay from initial_lr to min_lr
+            progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+            cosine_decay = 0.5 * (1.0 + np.cos(np.pi * progress))
+            return (min_lr + (initial_lr - min_lr) * cosine_decay) / initial_lr
+
+    return lr_lambda
 
 def compute_iou_corners(box1, box2):
     """
@@ -940,6 +974,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='YOLO Training/Inference')
     parser.add_argument('files', nargs='*', help='YAML config, .pt model, or image file')
     parser.add_argument('--img-size', type=int, default=640, help='Input image size (default: 640)')
+    parser.add_argument('--lr', type=float, default=1e-2, help='Initial learning rate (default: 0.01)')
+    parser.add_argument('--warmup-epochs', type=int, default=3, help='Number of warmup epochs (default: 3)')
+    parser.add_argument('--min-lr', type=float, default=1e-4, help='Minimum learning rate (default: 0.0001)')
+    parser.add_argument('--epochs', type=int, default=100, help='Total training epochs (default: 100)')
     parsed_args = parser.parse_args()
 
     # Extract file types from positional arguments
@@ -1040,29 +1078,56 @@ if __name__ == "__main__":
             print(f"Training images: {len(train_loader.dataset)}")
             print(f"Validation images: {len(val_loader.dataset)}")
             print(f"Device: {device}")
+            print(f"\nLearning Rate Schedule:")
+            print(f"  Initial LR: {parsed_args.lr}")
+            print(f"  Minimum LR: {parsed_args.min_lr}")
+            print(f"  Warmup epochs: {parsed_args.warmup_epochs}")
+            print(f"  Total epochs: {parsed_args.epochs}")
 
-            optimizer = optim.Adam(model.parameters(), lr=1e-3)
+            # Optimizer with initial learning rate (will be scaled by scheduler)
+            optimizer = optim.Adam(model.parameters(), lr=parsed_args.lr)
+
+            # Learning rate scheduler with warmup + cosine annealing
+            lr_lambda_fn = get_lr_lambda(
+                warmup_epochs=parsed_args.warmup_epochs,
+                total_epochs=parsed_args.epochs,
+                initial_lr=parsed_args.lr,
+                min_lr=parsed_args.min_lr
+            )
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda_fn)
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_path = f"yolo_{timestamp}.pt"
 
-            for epoch in tqdm(range(100), desc="Training"):
+            for epoch in tqdm(range(parsed_args.epochs), desc="Training"):
                 train_loss, bbox_loss, obj_loss, cls_loss = train_epoch(model, train_loader, optimizer, device, num_classes)
                 val_loss, val_prec, val_rec, val_f1 = eval_epoch(model, val_loader, device, num_classes)
 
+                # Get current learning rate
+                current_lr = optimizer.param_groups[0]['lr']
+
                 tqdm.write(f"Epoch {epoch+1}: "
                           f"Loss: {train_loss:.4f} (bbox: {bbox_loss:.4f}, obj: {obj_loss:.4f}, cls: {cls_loss:.4f}) | "
-                          f"Val: Loss {val_loss:.4f}, P {val_prec:.1f}%, R {val_rec:.1f}%, F1 {val_f1:.1f}%")
+                          f"Val: Loss {val_loss:.4f}, P {val_prec:.1f}%, R {val_rec:.1f}%, F1 {val_f1:.1f}% | "
+                          f"LR: {current_lr:.6f}")
 
                 torch.save({'model': model.state_dict(), 'epoch': epoch, 'num_classes': num_classes, 'img_size': img_size}, save_path)
+
+                # Update learning rate
+                scheduler.step()
 
             print(f"\nTraining complete. Model saved to {save_path}")
     else:
         print("Usage:")
-        print("  Training:     python train.py data.yaml [--img-size SIZE]")
+        print("  Training:     python train.py data.yaml [OPTIONS]")
         print("  Evaluation:   python train.py data.yaml model.pt [--img-size SIZE]")
         print("  Inference:    python train.py image.jpg model.pt [--img-size SIZE]")
         print("  Inspect:      python train.py model.pt")
         print("")
         print("Options:")
-        print("  --img-size SIZE  Input image size (default: 640)")
-        print("                   Must be divisible by 32 (e.g., 416, 512, 640, 1280)")
+        print("  --img-size SIZE        Input image size (default: 640)")
+        print("                         Must be divisible by 32 (e.g., 416, 512, 640, 1280)")
+        print("  --lr LR                Initial learning rate (default: 0.01)")
+        print("  --min-lr LR            Minimum learning rate (default: 0.0001)")
+        print("  --warmup-epochs N      Number of warmup epochs (default: 3)")
+        print("  --epochs N             Total training epochs (default: 100)")

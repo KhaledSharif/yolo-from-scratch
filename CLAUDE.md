@@ -134,10 +134,15 @@ Loss computed independently for each scale, then summed:
 5. Apply **global NMS** with IoU threshold 0.4
 
 **Training Loop:**
-- Adam optimizer, lr=1e-3
+- Adam optimizer with **YOLOv5-style learning rate scheduling**
+  - **Linear warmup** (epochs 0-2): LR ramps from 1e-6 → 1e-2
+  - **Cosine annealing** (epochs 3-99): LR decays from 1e-2 → 1e-4
+  - Configurable via CLI: `--lr`, `--min-lr`, `--warmup-epochs`
+- **Gradient clipping** (max_norm=10.0) to prevent exploding gradients
 - Batch size 8
 - Multi-scale loss printed with breakdown: bbox, objectness, class
 - Validation metrics: Loss, Precision, Recall, F1 (aggregated across scales)
+- Current learning rate displayed each epoch for monitoring
 - Checkpoint saved every epoch, includes `img_size` and `num_classes`
 
 **Model Statistics:**
@@ -149,15 +154,33 @@ Loss computed independently for each scale, then summed:
 
 ### Training
 ```bash
-# Default 640×640 resolution
+# Default 640×640 resolution with default LR schedule
 python train.py dataset.yaml
 
 # Custom resolution (must be divisible by 32)
 python train.py dataset.yaml --img-size 512
 python train.py dataset.yaml --img-size 1280
+
+# Customize learning rate schedule
+python train.py dataset.yaml --lr 0.02          # Higher initial LR
+python train.py dataset.yaml --min-lr 0.0001    # Minimum LR at end
+python train.py dataset.yaml --warmup-epochs 5  # Longer warmup
+python train.py dataset.yaml --epochs 50        # Shorter training
+
+# Combined options
+python train.py dataset.yaml --img-size 1024 --lr 0.015 --epochs 150
 ```
-Trains for 100 epochs, saves model as `yolo_YYYYMMDD_HHMMSS.pt`.
+
+**Default Learning Rate Schedule:**
+- Initial LR: `0.01` (10× higher than previous fixed LR)
+- Minimum LR: `0.0001`
+- Warmup: 3 epochs (linear ramp from 1e-6 to initial LR)
+- Decay: Cosine annealing from initial to minimum LR
+- Gradient clipping: max_norm=10.0
+
+Trains for 100 epochs by default, saves model as `yolo_YYYYMMDD_HHMMSS.pt`.
 Checkpoint includes img_size, so model can be loaded correctly later.
+Learning rate is logged each epoch for monitoring convergence.
 
 **Dataset YAML format:**
 ```yaml
@@ -272,14 +295,36 @@ Displays model architecture, parameter counts, and img_size.
 4. Concatenate all detections from all scales
 5. Apply **global NMS** with IoU threshold 0.4 (suppresses duplicates across scales)
 
-**Training Workflow (train_epoch, train.py:646-680):**
+**Training Workflow (train_epoch, train.py:646-684):**
 1. Get multi-scale anchors from model
 2. For each batch:
    - Stack targets by scale: `[batch_p3, batch_p4, batch_p5]`
    - Forward pass returns `[pred_p3, pred_p4, pred_p5]`
    - Compute multi-scale loss
-   - Backpropagate and update weights
+   - Backpropagate
+   - Clip gradients (max_norm=10.0) to prevent explosions
+   - Update weights with optimizer
 3. Checkpoint includes `img_size`, `num_classes`, and full model state
+
+**Learning Rate Scheduler (get_lr_lambda, train.py:790-822):**
+YOLOv5-style scheduler with two phases:
+1. **Warmup Phase** (epochs 0 to warmup_epochs-1):
+   ```python
+   lr = warmup_start_lr + (initial_lr - warmup_start_lr) * (epoch / warmup_epochs)
+   ```
+   - Prevents early training instability
+   - Default: ramps from 1e-6 → 1e-2 over 3 epochs
+
+2. **Cosine Annealing** (remaining epochs):
+   ```python
+   progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+   cosine_decay = 0.5 * (1.0 + cos(π * progress))
+   lr = min_lr + (initial_lr - min_lr) * cosine_decay
+   ```
+   - Smooth decay for fine-tuning
+   - Default: decays from 1e-2 → 1e-4 over epochs 3-99
+
+Implemented using `torch.optim.lr_scheduler.LambdaLR` and stepped after each epoch.
 
 **Evaluation Workflow (eval_epoch, train.py:714-788):**
 - Computes multi-scale loss on validation set
@@ -295,10 +340,9 @@ Displays model architecture, parameter counts, and img_size.
 This is a minimal implementation. Compared to production YOLOv5:
 - No data augmentation (mosaic, mixup, HSV, etc.)
 - Simpler backbone (not full CSPDarknet53 with deep C3 stacks)
-- No label smoothing, warmup, or cosine LR scheduling
+- No label smoothing
 - Evaluation metrics are grid-based (not true COCO-style AP/mAP)
 - No automatic anchor optimization (k-means clustering on dataset)
-- Fixed learning rate (no scheduling)
 - No mixed precision training (FP16/AMP)
 
 **YOLOv5 Features Implemented:**
@@ -306,6 +350,8 @@ This is a minimal implementation. Compared to production YOLOv5:
 ✅ **Three detection heads (P3/P4/P5) for small/medium/large objects**
 ✅ **C3 modules (CSP Bottleneck) with residual connections**
 ✅ **Scale-specific anchors with cross-scale matching**
+✅ **Learning rate scheduling with warmup and cosine annealing**
+✅ **Gradient clipping for training stability**
 ✅ SPPF (Spatial Pyramid Pooling - Fast)
 ✅ SiLU activation function
 ✅ YOLOv5-style offset prediction with decoding

@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-Interactive evaluation viewer for YOLO model.
-
-Usage:
-    python eval.py model.pt dataset.yaml
-
-Controls:
-    Right Arrow / D: Next image
-    Left Arrow / A:  Previous image
-    Q / ESC:         Quit
-"""
-
 import torch
 import cv2
 import numpy as np
@@ -140,11 +127,16 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model = YOLO(num_classes=num_classes).to(device)
+    # Load checkpoint first to get img_size
     checkpoint = torch.load(model_path, map_location=device)
+    img_size = checkpoint.get('img_size', 640)  # Default to 640 if not saved
+
+    # Create model with correct img_size
+    model = YOLO(num_classes=num_classes, img_size=img_size).to(device)
     model.load_state_dict(checkpoint['model'])
     model.eval()
     print(f"Loaded model from {model_path}")
+    print(f"Image size: {img_size}")
 
     # Interactive viewer
     current_idx = 0

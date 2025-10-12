@@ -1,10 +1,12 @@
 # YOLO from Scratch
 
-A minimal PyTorch implementation of YOLO (You Only Look Once) object detection, built from scratch for educational purposes.
+A YOLOv5-inspired PyTorch implementation of YOLO (You Only Look Once) object detection, built from scratch for educational purposes and practical applications.
 
 ## Features
 
-- **Anchor-based detection** with 3 anchors per grid cell (13×13 grid = 507 possible detections)
+- **YOLOv5 Architecture**: SPPF module + SiLU activation + offset prediction
+- **Configurable Resolution**: Default 640×640, supports 416, 512, 1280, etc.
+- **Anchor-based detection** with 3 anchors per grid cell
 - **CIoU loss** for accurate bounding box regression
 - **Multi-class support** with configurable number of classes
 - **NMS (Non-Maximum Suppression)** for removing duplicate detections
@@ -56,10 +58,16 @@ val: /path/to/dataset/val/images
 ### 2. Train
 
 ```bash
+# Default 640×640 resolution
 python train.py dataset.yaml
+
+# Custom resolution (must be divisible by 32)
+python train.py dataset.yaml --img-size 512   # Faster, lower memory
+python train.py dataset.yaml --img-size 1280  # Higher accuracy, more memory
 ```
 
 Training runs for 100 epochs and saves the model as `yolo_YYYYMMDD_HHMMSS.pt`.
+The checkpoint includes img_size, so it will be loaded automatically during inference/evaluation.
 
 **Training output:**
 ```
@@ -116,34 +124,53 @@ Visualize predictions vs. ground truth:
 - **S**: Save screenshot
 - **Q / ESC**: Quit
 
-## Architecture
+## Architecture (YOLOv5-style)
 
 ```
-Input (416×416×3)
+Input (configurable, default 640×640×3)
     ↓
-Conv2d(3→32, stride=2) + BN + LeakyReLU
-    ↓ (208×208)
-Conv2d(32→64, stride=2) + BN + LeakyReLU
-    ↓ (104×104)
-Conv2d(64→128, stride=2) + BN + LeakyReLU
-    ↓ (52×52)
-Conv2d(128→256, stride=2) + BN + LeakyReLU
-    ↓ (26×26)
-Conv2d(256→512, stride=2) + BN + LeakyReLU
-    ↓ (13×13)
+━━━ Backbone (5 stride-2 Conv layers) ━━━
+Conv2d(3→32, stride=2) + BN + SiLU
+    ↓ (320×320)
+Conv2d(32→64, stride=2) + BN + SiLU
+    ↓ (160×160)
+Conv2d(64→128, stride=2) + BN + SiLU
+    ↓ (80×80)
+Conv2d(128→256, stride=2) + BN + SiLU
+    ↓ (40×40)
+Conv2d(256→512, stride=2) + BN + SiLU
+    ↓ (20×20)
+━━━ SPPF Module (Multi-scale pooling) ━━━
+Conv 512→256 + MaxPool×3 sequential + Conv 1024→512
+    ↓ (20×20×512)
+━━━ Detection Head ━━━
 Conv2d(512→3×(5+nc), kernel=1)
     ↓
-Output (13×13×3×(5+nc))
+Output (20×20×3×(5+nc))  [grid_size = img_size // 32]
 ```
 
-**Each anchor predicts:**
-- `x, y, w, h`: Bounding box coordinates (normalized)
-- `objectness`: Confidence score
-- `class_probs`: Class probabilities (nc values)
+**Key Architecture Features:**
+- **SiLU Activation**: YOLOv5's standard activation (smoother gradients than LeakyReLU)
+- **SPPF Module**: Spatial Pyramid Pooling - Fast (2× faster than SPP, same output)
+- **Offset Prediction**: Outputs encoded offsets (t_x, t_y, t_w, t_h), decoded via YOLOv5 formulas
+- **Dynamic Grid Size**: Automatically calculated as img_size // 32
 
-**Default anchors (optimized for cones):**
+**Each anchor predicts:**
+- `t_x, t_y, t_w, t_h`: **Encoded offsets** (constrained predictions)
+- `objectness`: Confidence logit
+- `class_probs`: Class logits (nc values)
+
+**Decoding (YOLOv5 formulas):**
 ```python
-[[10, 13], [16, 30], [33, 23]]  # [width, height] in pixels at 416×416
+b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_size
+b_y = ((σ(t_y) * 2 - 0.5) + c_y) / grid_size
+b_w = (anchor_w * (2σ(t_w))²) / img_size
+b_h = (anchor_h * (2σ(t_h))²) / img_size
+```
+
+**Default anchors:**
+```python
+[[10, 13], [16, 30], [33, 23]]  # [width, height] in pixels
 ```
 
 ## Loss Function
@@ -170,15 +197,29 @@ Output (13×13×3×(5+nc))
 python train.py model.pt
 ```
 
-Displays architecture and parameter counts.
+Displays architecture, parameter counts, and img_size.
+
+### Custom Resolution
+
+```bash
+# Training with different resolutions
+python train.py dataset.yaml --img-size 416   # Faster, ~30% less memory
+python train.py dataset.yaml --img-size 512   # Good balance
+python train.py dataset.yaml --img-size 640   # Default (best for most tasks)
+python train.py dataset.yaml --img-size 1280  # High accuracy, 4× memory
+
+# Resolution must be divisible by 32 (due to 5 stride-2 layers)
+```
+
+**Note**: Model automatically uses saved img_size during inference/eval. Override with `--img-size` if needed.
 
 ### Custom Anchors
 
 Modify anchor boxes in the code or pass custom anchors:
 
 ```python
-model = YOLO(num_classes=3, anchors=[[15, 20], [25, 40], [45, 60]])
-dataset = YOLODataset(img_dir, num_classes=3, anchors=[[15, 20], [25, 40], [45, 60]])
+model = YOLO(num_classes=3, anchors=[[15, 20], [25, 40], [45, 60]], img_size=640)
+dataset = YOLODataset(img_dir, num_classes=3, anchors=[[15, 20], [25, 40], [45, 60]], img_size=640)
 ```
 
 For best results, compute optimal anchors using k-means clustering on your training set bounding boxes.
@@ -207,9 +248,11 @@ yolo-from-scratch/
 
 **train.py contains:**
 - `YOLODataset`: Dataset loader with anchor matching
-- `YOLO`: Model architecture
+- `SPPF`: Spatial Pyramid Pooling - Fast module
+- `YOLO`: Model architecture with backbone, SPPF, and detection head
+- `decode_predictions`: YOLOv5-style offset decoding
 - `ciou_loss`: Complete IoU loss function
-- `yolo_loss`: Composite loss function
+- `yolo_loss`: Composite loss function with decoding
 - `train_epoch`: Training loop
 - `eval_epoch`: Evaluation with metrics
 - `predict`: Inference with NMS
@@ -217,34 +260,39 @@ yolo-from-scratch/
 
 ## Implementation Notes
 
-### What This Implementation Has
+### YOLOv5 Features Implemented
 
-✅ Anchor-based detection (3 anchors per grid cell)
-✅ CIoU loss for bbox regression
-✅ BCE loss for objectness and classification
-✅ Multi-class support
-✅ Non-Maximum Suppression (NMS)
-✅ Proper anchor matching during training
-✅ Grid-based detection (13×13)
+✅ **SPPF Module**: Spatial Pyramid Pooling - Fast (2× faster than SPP)
+✅ **SiLU Activation**: YOLOv5's standard activation function
+✅ **Offset Prediction**: YOLOv5-style encoded predictions with decoding
+✅ **CIoU Loss**: Complete IoU for bbox regression
+✅ **Configurable Resolution**: 416, 512, 640, 1280, etc.
+✅ **Anchor-based Detection**: 3 anchors per grid cell with IoU matching
+✅ **Multi-class Support**: Configurable number of classes
+✅ **NMS**: Non-Maximum Suppression for duplicate removal
 
-### What This Implementation Lacks (vs. YOLOv5+)
+### What This Implementation Lacks (vs. Full YOLOv5)
 
-❌ Multi-scale detection (only 13×13 grid)
-❌ Feature Pyramid Network (FPN) / PANet
-❌ CSPDarknet backbone
+❌ Multi-scale detection (only single grid size, not P3/P4/P5)
+❌ Feature Pyramid Network (FPN) / PANet neck
+❌ Full CSPDarknet backbone with C3 blocks
 ❌ Data augmentation (Mosaic, MixUp, HSV)
-❌ Advanced training techniques (warmup, cosine LR, label smoothing)
+❌ Advanced training (warmup, cosine LR, label smoothing)
 ❌ True mAP evaluation (uses grid-based precision/recall)
-❌ Automatic anchor optimization (k-means)
+❌ Automatic anchor optimization (k-means clustering)
 
 ## Tips for Best Results
 
-1. **Balance your dataset**: Ensure roughly equal numbers of examples per class
-2. **Use appropriate anchors**: Tune anchors to match your object sizes
-3. **Monitor F1 score**: Best indicator of overall detection quality
-4. **Adjust confidence threshold**: Lower for more detections, higher for fewer false positives
-5. **Check with eval.py**: Visually inspect predictions to diagnose issues
-6. **Train longer**: 100 epochs may not be enough for complex datasets
+1. **Start with default 640×640**: Good balance between speed and accuracy for most tasks
+2. **Adjust resolution based on object sizes**:
+   - Small objects: Use 1280×1280 (more GPU memory required)
+   - Large objects or speed priority: Use 512×512 or 416×416
+3. **Balance your dataset**: Ensure roughly equal numbers of examples per class
+4. **Use appropriate anchors**: Tune anchors to match your object sizes (k-means on training set)
+5. **Monitor F1 score**: Best indicator of overall detection quality
+6. **Adjust confidence threshold**: Lower for more detections, higher for fewer false positives
+7. **Check with eval.py**: Visually inspect predictions to diagnose issues
+8. **Train longer**: 100 epochs may not be enough for complex datasets
 
 ## Troubleshooting
 

@@ -12,14 +12,14 @@ import glob
 from datetime import datetime
 
 class YOLODataset(Dataset):
-    def __init__(self, img_dir, num_classes=1, anchors=None):
+    def __init__(self, img_dir, num_classes=1, anchors=None, img_size=640):
         self.imgs = sorted(glob.glob(f"{img_dir}/*.jpg") + glob.glob(f"{img_dir}/*.png"))
         self.labels = [p.replace('/images/', '/labels/').rsplit('.', 1)[0] + '.txt' for p in self.imgs]
         self.num_classes = num_classes
-        self.grid_size = 13
-        self.img_size = 416
+        self.img_size = img_size
+        self.grid_size = img_size // 32  # 5 stride-2 convs = 32× downsample
 
-        # Default anchors (width, height in pixels at 416x416)
+        # Default anchors (width, height in pixels)
         if anchors is None:
             anchors = [[10, 13], [16, 30], [33, 23]]
 
@@ -106,6 +106,35 @@ class YOLODataset(Dataset):
 
         return img, target
 
+class SPPF(nn.Module):
+    """
+    Spatial Pyramid Pooling - Fast (SPPF) layer.
+
+    YOLOv5's efficient implementation of SPP that applies sequential max pooling
+    instead of parallel pooling, which is 2× faster while producing the same output.
+
+    Structure: Conv → MaxPool → MaxPool → MaxPool → Concat all → Conv
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=5):
+        super().__init__()
+        hidden_channels = in_channels // 2
+        self.conv1 = nn.Conv2d(in_channels, hidden_channels, 1, 1)
+        self.bn1 = nn.BatchNorm2d(hidden_channels)
+        self.act = nn.SiLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+        self.conv2 = nn.Conv2d(hidden_channels * 4, out_channels, 1, 1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.act(self.bn1(self.conv1(x)))
+        # Apply maxpool 3 times sequentially and concatenate with original
+        y1 = self.maxpool(x)
+        y2 = self.maxpool(y1)
+        y3 = self.maxpool(y2)
+        # Concatenate along channel dimension: [x, y1, y2, y3]
+        out = torch.cat([x, y1, y2, y3], dim=1)
+        return self.act(self.bn2(self.conv2(out)))
+
 class YOLO(nn.Module):
     """
     YOLO object detection model with YOLOv5-style offset prediction.
@@ -127,37 +156,49 @@ class YOLO(nn.Module):
     This approach constrains predictions to be near their responsible grid cell
     and scales dimensions relative to anchor size, improving training stability.
     """
-    def __init__(self, num_classes=1, anchors=None):
+    def __init__(self, num_classes=1, anchors=None, img_size=640):
         super().__init__()
         self.num_classes = num_classes
+        self.img_size = img_size
+        self.grid_size = img_size // 32  # 5 stride-2 convs = 2^5 = 32 downsample
 
-        # Default anchors for 13x13 grid (width, height in pixels at 416x416)
+        # Default anchors (width, height in pixels)
         # Optimized for cone-like objects at different scales
         if anchors is None:
             anchors = [[10, 13], [16, 30], [33, 23]]
 
         self.anchors = torch.tensor(anchors, dtype=torch.float32)
         self.num_anchors = len(anchors)
-        self.grid_size = 13
 
         # Output: num_anchors * (5 + num_classes) per grid cell
         # Each anchor predicts: t_x, t_y, t_w, t_h (OFFSETS), objectness_logit, class_logits
         self.output_channels = self.num_anchors * (5 + num_classes)
 
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.LeakyReLU(0.1),
-            nn.Conv2d(32, 64, 3, 2, 1), nn.BatchNorm2d(64), nn.LeakyReLU(0.1),
-            nn.Conv2d(64, 128, 3, 2, 1), nn.BatchNorm2d(128), nn.LeakyReLU(0.1),
-            nn.Conv2d(128, 256, 3, 2, 1), nn.BatchNorm2d(256), nn.LeakyReLU(0.1),
-            nn.Conv2d(256, 512, 3, 2, 1), nn.BatchNorm2d(512), nn.LeakyReLU(0.1),
-            nn.Conv2d(512, self.output_channels, 1)
+        # Backbone: 5 stride-2 conv layers with SiLU activation (YOLOv5 standard)
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.SiLU(),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.BatchNorm2d(64), nn.SiLU(),
+            nn.Conv2d(64, 128, 3, 2, 1), nn.BatchNorm2d(128), nn.SiLU(),
+            nn.Conv2d(128, 256, 3, 2, 1), nn.BatchNorm2d(256), nn.SiLU(),
+            nn.Conv2d(256, 512, 3, 2, 1), nn.BatchNorm2d(512), nn.SiLU(),
         )
+
+        # SPPF: Spatial Pyramid Pooling - Fast (YOLOv5 feature)
+        self.sppf = SPPF(512, 512)
+
+        # Detection head: 1x1 conv to output channels
+        self.head = nn.Conv2d(512, self.output_channels, 1)
 
     def forward(self, x):
         batch_size = x.shape[0]
-        out = self.net(x)  # (B, num_anchors*(5+nc), 13, 13)
+        # Backbone: feature extraction
+        x = self.backbone(x)  # (B, 512, grid_size, grid_size)
+        # SPPF: multi-scale pooling
+        x = self.sppf(x)  # (B, 512, grid_size, grid_size)
+        # Detection head
+        out = self.head(x)  # (B, num_anchors*(5+nc), grid_size, grid_size)
 
-        # Reshape to (B, 13, 13, num_anchors, 5+nc)
+        # Reshape to (B, grid_size, grid_size, num_anchors, 5+nc)
         out = out.view(batch_size, self.num_anchors, 5 + self.num_classes,
                       self.grid_size, self.grid_size)
         out = out.permute(0, 3, 4, 1, 2).contiguous()
@@ -240,7 +281,7 @@ def ciou_loss(pred_boxes, target_boxes, eps=1e-7):
 
     return loss.mean()
 
-def decode_predictions(raw_preds, anchors, grid_size=13, img_size=416):
+def decode_predictions(raw_preds, anchors, grid_size=None, img_size=640):
     """
     Decode raw YOLO predictions from offset format to absolute coordinates.
 
@@ -265,6 +306,9 @@ def decode_predictions(raw_preds, anchors, grid_size=13, img_size=416):
                 Objectness and class predictions remain as logits (unchanged).
     """
     _, h, w, num_anchors, _ = raw_preds.shape
+    # Infer grid_size from shape if not provided
+    if grid_size is None:
+        grid_size = h  # Assume square grid
     decoded = raw_preds.clone()
 
     # Create grid coordinate meshes
@@ -452,9 +496,10 @@ def eval_epoch(model, loader, device, num_classes=1, iou_threshold=0.5, conf_thr
                 preds_eval[..., 5:] = torch.sigmoid(preds[..., 5:])
 
             # Evaluate each image in batch (now with anchor dimension)
+            grid_size = model.grid_size
             for b in range(preds.shape[0]):
-                for i in range(13):
-                    for j in range(13):
+                for i in range(grid_size):
+                    for j in range(grid_size):
                         for a in range(preds.shape[3]):  # Iterate over anchors
                             pred_obj = preds_eval[b, i, j, a, 4].item()
                             target_obj = targets[b, i, j, a, 4].item()
@@ -555,15 +600,16 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     # Load and preprocess image
     pil_img = Image.open(image_path).convert('RGB')
     orig_w, orig_h = pil_img.size
-    pil_img = pil_img.resize((416, 416))
+    img_size = model.img_size
+    pil_img = pil_img.resize((img_size, img_size))
     img = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
     img = img.unsqueeze(0).to(device)  # Add batch dimension
 
     with torch.no_grad():
-        preds = model(img)  # (1, 13, 13, num_anchors, 5+nc) - RAW outputs
+        preds = model(img)  # (1, grid_size, grid_size, num_anchors, 5+nc) - RAW outputs
 
     # Decode predictions from offset format to absolute coordinates
-    preds_decoded = decode_predictions(preds, model.anchors)
+    preds_decoded = decode_predictions(preds, model.anchors, model.grid_size, img_size)
 
     # Apply sigmoid to objectness and class predictions
     # Use RAW predictions for sigmoid (not decoded)
@@ -573,10 +619,11 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
 
     detections = []
     num_anchors = preds.shape[3]
+    grid_size = model.grid_size
 
     # Convert grid predictions to image coordinates (iterate over anchors too)
-    for i in range(13):
-        for j in range(13):
+    for i in range(grid_size):
+        for j in range(grid_size):
             for a in range(num_anchors):  # Iterate over all anchors
                 obj_conf = preds_decoded[0, i, j, a, 4].item()
 
@@ -596,11 +643,11 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
                         class_id = int(class_probs.argmax())
                         class_prob = class_probs[class_id]
 
-                    # Convert to pixel coordinates (0-416)
-                    x_center_px = x_center * 416
-                    y_center_px = y_center * 416
-                    width_px = width * 416
-                    height_px = height * 416
+                    # Convert to pixel coordinates (0-img_size)
+                    x_center_px = x_center * img_size
+                    y_center_px = y_center * img_size
+                    width_px = width * img_size
+                    height_px = height * img_size
 
                     # Convert to corner format
                     x1 = x_center_px - width_px / 2
@@ -609,10 +656,10 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
                     y2 = y_center_px + height_px / 2
 
                     # Scale back to original image size
-                    x1 = (x1 / 416) * orig_w
-                    y1 = (y1 / 416) * orig_h
-                    x2 = (x2 / 416) * orig_w
-                    y2 = (y2 / 416) * orig_h
+                    x1 = (x1 / img_size) * orig_w
+                    y1 = (y1 / img_size) * orig_h
+                    x2 = (x2 / img_size) * orig_w
+                    y2 = (y2 / img_size) * orig_h
 
                     # Combined confidence
                     conf = obj_conf * class_prob
@@ -624,10 +671,20 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     return detections
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    yaml_file = next((a for a in args if a.endswith('.yaml') or a.endswith('.yml')), None)
-    pt_file = next((a for a in args if a.endswith('.pt')), None)
-    image_file = next((a for a in args if a.endswith(('.jpg', '.png', '.jpeg'))), None)
+    import argparse
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='YOLO Training/Inference')
+    parser.add_argument('files', nargs='*', help='YAML config, .pt model, or image file')
+    parser.add_argument('--img-size', type=int, default=640, help='Input image size (default: 640)')
+    parsed_args = parser.parse_args()
+
+    # Extract file types from positional arguments
+    yaml_file = next((a for a in parsed_args.files if a.endswith('.yaml') or a.endswith('.yml')), None)
+    pt_file = next((a for a in parsed_args.files if a.endswith('.pt')), None)
+    image_file = next((a for a in parsed_args.files if a.endswith(('.jpg', '.png', '.jpeg'))), None)
+
+    img_size = parsed_args.img_size
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Determine num_classes from config if available
@@ -638,15 +695,19 @@ if __name__ == "__main__":
             config = yaml.safe_load(f)
         num_classes = config.get('nc', 1)
 
-    # Create model with appropriate num_classes
-    model = YOLO(num_classes=num_classes).to(device)
+    # Create model with appropriate num_classes and img_size
+    model = YOLO(num_classes=num_classes, img_size=img_size).to(device)
 
     if pt_file and not yaml_file and not image_file:
         # Inspect mode: python train.py model.pt
         checkpoint = torch.load(pt_file, map_location=device)
+        # Use saved img_size if available, otherwise use CLI arg
+        if 'img_size' in checkpoint:
+            model = YOLO(num_classes=num_classes, img_size=checkpoint['img_size']).to(device)
         model.load_state_dict(checkpoint['model'])
         print(f"Model loaded from {pt_file}")
         print(f"Number of classes: {num_classes}")
+        print(f"Image size: {model.img_size}")
         print("\nModel architecture:")
         for name, param in model.named_parameters():
             print(f"  {name}: {list(param.shape)}, {param.numel()} parameters")
@@ -656,9 +717,12 @@ if __name__ == "__main__":
     elif image_file and pt_file:
         # Inference mode: python train.py image.jpg model.pt
         checkpoint = torch.load(pt_file, map_location=device)
+        # Use saved img_size if available, otherwise use CLI arg
+        if 'img_size' in checkpoint:
+            model = YOLO(num_classes=num_classes, img_size=checkpoint['img_size']).to(device)
         model.load_state_dict(checkpoint['model'])
         print(f"Running inference on {image_file}")
-        print(f"Model: {pt_file}, Classes: {num_classes}")
+        print(f"Model: {pt_file}, Classes: {num_classes}, Image size: {model.img_size}")
 
         detections = predict(model, image_file, device, num_classes=num_classes)
 
@@ -672,17 +736,25 @@ if __name__ == "__main__":
 
     elif yaml_file and config is not None:
         # Training or evaluation mode
-        train_loader = DataLoader(YOLODataset(config['train'], num_classes=num_classes),
-                                   batch_size=8, shuffle=True)
-        val_loader = DataLoader(YOLODataset(config['val'], num_classes=num_classes),
-                                batch_size=8)
-
         if pt_file:
             # Eval mode: python train.py data.yaml model.pt
             checkpoint = torch.load(pt_file, map_location=device)
+            # Use saved img_size if available, otherwise use CLI arg
+            if 'img_size' in checkpoint:
+                img_size = checkpoint['img_size']
+                model = YOLO(num_classes=num_classes, img_size=img_size).to(device)
             model.load_state_dict(checkpoint['model'])
             print(f"Evaluating model from {pt_file}")
             print(f"Number of classes: {num_classes}")
+            print(f"Image size: {model.img_size}")
+
+        # Create dataloaders with correct img_size
+        train_loader = DataLoader(YOLODataset(config['train'], num_classes=num_classes, img_size=img_size),
+                                   batch_size=8, shuffle=True)
+        val_loader = DataLoader(YOLODataset(config['val'], num_classes=num_classes, img_size=img_size),
+                                batch_size=8)
+
+        if pt_file:
 
             train_loss, train_prec, train_rec, train_f1 = eval_epoch(model, train_loader, device, num_classes)
             val_loss, val_prec, val_rec, val_f1 = eval_epoch(model, val_loader, device, num_classes)
@@ -718,12 +790,16 @@ if __name__ == "__main__":
                           f"Loss: {train_loss:.4f} (bbox: {bbox_loss:.4f}, obj: {obj_loss:.4f}, cls: {cls_loss:.4f}) | "
                           f"Val: Loss {val_loss:.4f}, P {val_prec:.1f}%, R {val_rec:.1f}%, F1 {val_f1:.1f}%")
 
-                torch.save({'model': model.state_dict(), 'epoch': epoch, 'num_classes': num_classes}, save_path)
+                torch.save({'model': model.state_dict(), 'epoch': epoch, 'num_classes': num_classes, 'img_size': img_size}, save_path)
 
             print(f"\nTraining complete. Model saved to {save_path}")
     else:
         print("Usage:")
-        print("  Training:     python train.py data.yaml")
-        print("  Evaluation:   python train.py data.yaml model.pt")
-        print("  Inference:    python train.py image.jpg model.pt")
+        print("  Training:     python train.py data.yaml [--img-size SIZE]")
+        print("  Evaluation:   python train.py data.yaml model.pt [--img-size SIZE]")
+        print("  Inference:    python train.py image.jpg model.pt [--img-size SIZE]")
         print("  Inspect:      python train.py model.pt")
+        print("")
+        print("Options:")
+        print("  --img-size SIZE  Input image size (default: 640)")
+        print("                   Must be divisible by 32 (e.g., 416, 512, 640, 1280)")

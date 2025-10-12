@@ -1,6 +1,6 @@
 # YOLO from Scratch
 
-A minimal PyTorch implementation of YOLO (You Only Look Once) object detection, built from scratch for educational purposes and practical single-class detection tasks.
+A minimal PyTorch implementation of YOLO (You Only Look Once) object detection, built from scratch for educational purposes.
 
 ## Features
 
@@ -236,8 +236,6 @@ yolo-from-scratch/
 ❌ Advanced training techniques (warmup, cosine LR, label smoothing)
 ❌ True mAP evaluation (uses grid-based precision/recall)
 ❌ Automatic anchor optimization (k-means)
-
-This is a **minimal educational implementation** suitable for learning YOLO concepts and simple detection tasks. For production use, consider YOLOv5, YOLOv8, or other established frameworks.
 
 ## Tips for Best Results
 

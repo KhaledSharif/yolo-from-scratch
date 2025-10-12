@@ -18,7 +18,7 @@ import yaml
 import sys
 import glob
 from pathlib import Path
-from yolo import YOLO, predict
+from train import YOLO, predict
 
 
 def load_ground_truth(label_path):

@@ -107,6 +107,26 @@ class YOLODataset(Dataset):
         return img, target
 
 class YOLO(nn.Module):
+    """
+    YOLO object detection model with YOLOv5-style offset prediction.
+
+    The model outputs ENCODED predictions (t_x, t_y, t_w, t_h) that must be decoded
+    to absolute coordinates before use. See decode_predictions() function.
+
+    Architecture:
+    - 5 stride-2 conv layers reduce 416x416 input to 13x13 feature map
+    - Detection head outputs: num_anchors * (5 + num_classes) channels per grid cell
+    - Each anchor predicts: t_x, t_y, t_w, t_h (offsets), objectness, class_probs
+
+    Decoding formulas (applied in decode_predictions):
+    - b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_size
+    - b_y = ((σ(t_y) * 2 - 0.5) + c_y) / grid_size
+    - b_w = (anchor_w * (2 * σ(t_w))²) / img_size
+    - b_h = (anchor_h * (2 * σ(t_h))²) / img_size
+
+    This approach constrains predictions to be near their responsible grid cell
+    and scales dimensions relative to anchor size, improving training stability.
+    """
     def __init__(self, num_classes=1, anchors=None):
         super().__init__()
         self.num_classes = num_classes
@@ -121,7 +141,7 @@ class YOLO(nn.Module):
         self.grid_size = 13
 
         # Output: num_anchors * (5 + num_classes) per grid cell
-        # Each anchor predicts: tx, ty, tw, th, objectness, class_probs
+        # Each anchor predicts: t_x, t_y, t_w, t_h (OFFSETS), objectness_logit, class_logits
         self.output_channels = self.num_anchors * (5 + num_classes)
 
         self.net = nn.Sequential(
@@ -220,20 +240,89 @@ def ciou_loss(pred_boxes, target_boxes, eps=1e-7):
 
     return loss.mean()
 
-def yolo_loss(predictions, targets, num_classes=1):
+def decode_predictions(raw_preds, anchors, grid_size=13, img_size=416):
+    """
+    Decode raw YOLO predictions from offset format to absolute coordinates.
+
+    Implements YOLOv5-style decoding where the network outputs offsets (t_x, t_y, t_w, t_h)
+    that are transformed into absolute bounding box coordinates:
+    - Centers: b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_size
+    - Dims: b_w = (anchor_w * (2 * σ(t_w))²) / img_size
+
+    This constrains predictions to be near their responsible grid cell and scales
+    dimensions relative to anchor size, improving training stability.
+
+    Args:
+        raw_preds: (batch, grid_size, grid_size, num_anchors, 5+nc)
+                   Raw network outputs where first 4 values are t_x, t_y, t_w, t_h
+        anchors: (num_anchors, 2) tensor of anchor dimensions [width, height] in pixels
+        grid_size: Size of detection grid (default 13)
+        img_size: Input image size in pixels (default 416)
+
+    Returns:
+        decoded: Same shape as raw_preds but with first 4 values as absolute coordinates
+                (b_x, b_y, b_w, b_h) in normalized [0,1] range.
+                Objectness and class predictions remain as logits (unchanged).
+    """
+    _, h, w, num_anchors, _ = raw_preds.shape
+    decoded = raw_preds.clone()
+
+    # Create grid coordinate meshes
+    # grid_x[i,j] = j (column index), grid_y[i,j] = i (row index)
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(h, device=raw_preds.device, dtype=raw_preds.dtype),
+        torch.arange(w, device=raw_preds.device, dtype=raw_preds.dtype),
+        indexing='ij'
+    )
+    # Reshape for broadcasting: (h, w) -> (1, h, w, 1)
+    grid_x = grid_x.view(1, h, w, 1)
+    grid_y = grid_y.view(1, h, w, 1)
+
+    # Move anchors to same device as predictions
+    anchors = anchors.to(raw_preds.device)
+
+    # Decode center coordinates (x, y)
+    # Sigmoid constrains offset to [0, 1], multiply by 2 and subtract 0.5 gives [-0.5, 1.5]
+    # This allows the center to be up to 0.5 cells outside the responsible cell
+    # Formula: b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_size
+    decoded[..., 0] = ((torch.sigmoid(raw_preds[..., 0]) * 2.0 - 0.5) + grid_x) / grid_size
+    decoded[..., 1] = ((torch.sigmoid(raw_preds[..., 1]) * 2.0 - 0.5) + grid_y) / grid_size
+
+    # Decode dimensions (w, h)
+    # Sigmoid constrains to [0, 1], multiply by 2 gives [0, 2], square gives [0, 4]
+    # This means predicted dimension can be up to 4x the anchor size
+    # Formula: b_w = (anchor_w * (2 * σ(t_w))²) / img_size
+    # Need to apply per-anchor since each anchor has different base dimensions
+    for a in range(num_anchors):
+        anchor_w, anchor_h = anchors[a]
+        decoded[:, :, :, a, 2] = (anchor_w / img_size) * torch.pow(2.0 * torch.sigmoid(raw_preds[:, :, :, a, 2]), 2)
+        decoded[:, :, :, a, 3] = (anchor_h / img_size) * torch.pow(2.0 * torch.sigmoid(raw_preds[:, :, :, a, 3]), 2)
+
+    # Objectness and class predictions remain as logits (will be passed to BCEWithLogitsLoss)
+    # No modification needed: decoded[..., 4:] already copied via clone()
+
+    return decoded
+
+def yolo_loss(predictions, targets, anchors, num_classes=1):
     """
     Composite YOLO loss function with anchor support and CIoU.
 
     Args:
-        predictions: (batch, 13, 13, num_anchors, 5+nc) - model output
-        targets: (batch, 13, 13, num_anchors, 5+nc) - ground truth
+        predictions: (batch, 13, 13, num_anchors, 5+nc) - RAW model output (t_x, t_y, t_w, t_h, ...)
+        targets: (batch, 13, 13, num_anchors, 5+nc) - ground truth (x, y, w, h, ...)
+        anchors: (num_anchors, 2) - anchor dimensions [width, height] in pixels
         num_classes: number of classes
 
     Returns:
         total_loss, bbox_loss, obj_loss, class_loss
     """
-    # Separate components
-    pred_boxes = predictions[..., 0:4]      # x, y, w, h
+    # Decode predictions from offset format to absolute coordinates
+    # This transforms t_x, t_y, t_w, t_h -> b_x, b_y, b_w, b_h
+    decoded_preds = decode_predictions(predictions, anchors)
+
+    # Extract components from DECODED predictions for bbox loss
+    pred_boxes = decoded_preds[..., 0:4]     # x, y, w, h (now absolute coordinates)
+    # Use RAW predictions for objectness and class (need logits for BCEWithLogitsLoss)
     pred_obj = predictions[..., 4:5]         # objectness (logits)
     pred_class = predictions[..., 5:]        # class probs (logits)
 
@@ -276,13 +365,16 @@ def train_epoch(model, loader, optimizer, device, num_classes=1):
     model.train()
     total_loss, total_bbox, total_obj, total_cls = 0, 0, 0, 0
 
+    # Get anchors from model for decoding predictions
+    anchors = model.anchors
+
     for imgs, targets in loader:
         imgs, targets = imgs.to(device), targets.to(device)
         optimizer.zero_grad()
         preds = model(imgs)
 
-        # Use composite loss function
-        loss, bbox_loss, obj_loss, cls_loss = yolo_loss(preds, targets, num_classes)
+        # Use composite loss function (will decode predictions internally)
+        loss, bbox_loss, obj_loss, cls_loss = yolo_loss(preds, targets, anchors, num_classes)
 
         loss.backward()
         optimizer.step()
@@ -337,20 +429,27 @@ def eval_epoch(model, loader, device, num_classes=1, iou_threshold=0.5, conf_thr
     false_positives = 0
     false_negatives = 0
 
+    # Get anchors from model for decoding predictions
+    anchors = model.anchors
+
     with torch.no_grad():
         for imgs, targets in loader:
             imgs, targets = imgs.to(device), targets.to(device)
             preds = model(imgs)
 
-            # Calculate loss
-            loss, _, _, _ = yolo_loss(preds, targets, num_classes)
+            # Calculate loss (will decode predictions internally)
+            loss, _, _, _ = yolo_loss(preds, targets, anchors, num_classes)
             total_loss += loss.item()
 
+            # Decode predictions from offset format to absolute coordinates
+            preds_decoded = decode_predictions(preds, anchors)
+
             # Apply sigmoid to objectness and class predictions for evaluation
-            preds_eval = preds.clone()
-            preds_eval[..., 4] = torch.sigmoid(preds_eval[..., 4])
+            # Use RAW predictions for objectness/class (need to apply sigmoid)
+            preds_eval = preds_decoded.clone()
+            preds_eval[..., 4] = torch.sigmoid(preds[..., 4])
             if num_classes > 0:
-                preds_eval[..., 5:] = torch.sigmoid(preds_eval[..., 5:])
+                preds_eval[..., 5:] = torch.sigmoid(preds[..., 5:])
 
             # Evaluate each image in batch (now with anchor dimension)
             for b in range(preds.shape[0]):
@@ -461,12 +560,16 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     img = img.unsqueeze(0).to(device)  # Add batch dimension
 
     with torch.no_grad():
-        preds = model(img)  # (1, 13, 13, num_anchors, 5+nc)
+        preds = model(img)  # (1, 13, 13, num_anchors, 5+nc) - RAW outputs
+
+    # Decode predictions from offset format to absolute coordinates
+    preds_decoded = decode_predictions(preds, model.anchors)
 
     # Apply sigmoid to objectness and class predictions
-    preds[..., 4] = torch.sigmoid(preds[..., 4])
+    # Use RAW predictions for sigmoid (not decoded)
+    preds_decoded[..., 4] = torch.sigmoid(preds[..., 4])
     if num_classes > 0:
-        preds[..., 5:] = torch.sigmoid(preds[..., 5:])
+        preds_decoded[..., 5:] = torch.sigmoid(preds[..., 5:])
 
     detections = []
     num_anchors = preds.shape[3]
@@ -475,20 +578,21 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     for i in range(13):
         for j in range(13):
             for a in range(num_anchors):  # Iterate over all anchors
-                obj_conf = preds[0, i, j, a, 4].item()
+                obj_conf = preds_decoded[0, i, j, a, 4].item()
 
                 if obj_conf > conf_threshold:
-                    x_center = preds[0, i, j, a, 0].item()
-                    y_center = preds[0, i, j, a, 1].item()
-                    width = preds[0, i, j, a, 2].item()
-                    height = preds[0, i, j, a, 3].item()
+                    # Extract DECODED coordinates (already in normalized [0,1] range)
+                    x_center = preds_decoded[0, i, j, a, 0].item()
+                    y_center = preds_decoded[0, i, j, a, 1].item()
+                    width = preds_decoded[0, i, j, a, 2].item()
+                    height = preds_decoded[0, i, j, a, 3].item()
 
-                    # Get class prediction
+                    # Get class prediction (use decoded predictions with sigmoid already applied)
                     if num_classes == 1:
-                        class_prob = preds[0, i, j, a, 5].item()
+                        class_prob = preds_decoded[0, i, j, a, 5].item()
                         class_id = 0
                     else:
-                        class_probs = preds[0, i, j, a, 5:].cpu().numpy()
+                        class_probs = preds_decoded[0, i, j, a, 5:].cpu().numpy()
                         class_id = int(class_probs.argmax())
                         class_prob = class_probs[class_id]
 

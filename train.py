@@ -12,23 +12,56 @@ import glob
 from datetime import datetime
 
 class YOLODataset(Dataset):
-    def __init__(self, img_dir, num_classes=1):
+    def __init__(self, img_dir, num_classes=1, anchors=None):
         self.imgs = sorted(glob.glob(f"{img_dir}/*.jpg") + glob.glob(f"{img_dir}/*.png"))
         self.labels = [p.replace('/images/', '/labels/').rsplit('.', 1)[0] + '.txt' for p in self.imgs]
         self.num_classes = num_classes
         self.grid_size = 13
+        self.img_size = 416
+
+        # Default anchors (width, height in pixels at 416x416)
+        if anchors is None:
+            anchors = [[10, 13], [16, 30], [33, 23]]
+
+        self.anchors = torch.tensor(anchors, dtype=torch.float32)
+        self.num_anchors = len(anchors)
         self.output_dim = 5 + num_classes  # x, y, w, h, objectness + class probs
 
     def __len__(self):
         return len(self.imgs)
 
+    def compute_anchor_iou(self, box_wh, anchors):
+        """
+        Compute IoU between a box and all anchors (without considering position).
+
+        Args:
+            box_wh: (width, height) in pixels
+            anchors: (num_anchors, 2) tensor of anchor dimensions
+
+        Returns:
+            iou: (num_anchors,) tensor of IoU values
+        """
+        box_area = box_wh[0] * box_wh[1]
+        anchor_area = anchors[:, 0] * anchors[:, 1]
+
+        # Intersection (assuming both centered at origin)
+        inter_w = torch.min(box_wh[0], anchors[:, 0])
+        inter_h = torch.min(box_wh[1], anchors[:, 1])
+        inter_area = inter_w * inter_h
+
+        # Union
+        union_area = box_area + anchor_area - inter_area
+
+        iou = inter_area / (union_area + 1e-16)
+        return iou
+
     def __getitem__(self, idx):
         # Load and preprocess image
-        pil_img = Image.open(self.imgs[idx]).convert('RGB').resize((416, 416))
+        pil_img = Image.open(self.imgs[idx]).convert('RGB').resize((self.img_size, self.img_size))
         img = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
 
-        # Initialize empty target (grid_size x grid_size x output_dim)
-        target = torch.zeros((self.grid_size, self.grid_size, self.output_dim))
+        # Initialize empty target (grid_size x grid_size x num_anchors x output_dim)
+        target = torch.zeros((self.grid_size, self.grid_size, self.num_anchors, self.output_dim))
 
         # Load all boxes from label file
         if Path(self.labels[idx]).exists():
@@ -47,27 +80,50 @@ class YOLODataset(Dataset):
                         grid_x = min(grid_x, self.grid_size - 1)
                         grid_y = min(grid_y, self.grid_size - 1)
 
-                        # Only assign if this cell doesn't already have an object
-                        # (Simple handling: one object per grid cell)
-                        if target[grid_y, grid_x, 4] == 0:
+                        # Convert box dimensions to pixels
+                        box_w_px = width * self.img_size
+                        box_h_px = height * self.img_size
+                        box_wh = torch.tensor([box_w_px, box_h_px])
+
+                        # Find best matching anchor
+                        ious = self.compute_anchor_iou(box_wh, self.anchors)
+                        best_anchor_idx = torch.argmax(ious).item()
+
+                        # Only assign if this cell+anchor doesn't already have an object
+                        if target[grid_y, grid_x, best_anchor_idx, 4] == 0:
                             # Set bounding box coordinates
-                            target[grid_y, grid_x, 0:4] = torch.tensor([x_center, y_center, width, height])
+                            target[grid_y, grid_x, best_anchor_idx, 0:4] = torch.tensor(
+                                [x_center, y_center, width, height]
+                            )
                             # Set objectness
-                            target[grid_y, grid_x, 4] = 1.0
-                            # Set class probability (for single class, just set to 1.0)
+                            target[grid_y, grid_x, best_anchor_idx, 4] = 1.0
+                            # Set class probability
                             if self.num_classes == 1:
-                                target[grid_y, grid_x, 5] = 1.0
+                                target[grid_y, grid_x, best_anchor_idx, 5] = 1.0
                             else:
                                 # For multi-class, use one-hot encoding
-                                target[grid_y, grid_x, 5 + class_id] = 1.0
+                                target[grid_y, grid_x, best_anchor_idx, 5 + class_id] = 1.0
 
         return img, target
 
 class YOLO(nn.Module):
-    def __init__(self, num_classes=1):
+    def __init__(self, num_classes=1, anchors=None):
         super().__init__()
         self.num_classes = num_classes
-        self.output_channels = 5 + num_classes  # x, y, w, h, objectness + class probs
+
+        # Default anchors for 13x13 grid (width, height in pixels at 416x416)
+        # Optimized for cone-like objects at different scales
+        if anchors is None:
+            anchors = [[10, 13], [16, 30], [33, 23]]
+
+        self.anchors = torch.tensor(anchors, dtype=torch.float32)
+        self.num_anchors = len(anchors)
+        self.grid_size = 13
+
+        # Output: num_anchors * (5 + num_classes) per grid cell
+        # Each anchor predicts: tx, ty, tw, th, objectness, class_probs
+        self.output_channels = self.num_anchors * (5 + num_classes)
+
         self.net = nn.Sequential(
             nn.Conv2d(3, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.LeakyReLU(0.1),
             nn.Conv2d(32, 64, 3, 2, 1), nn.BatchNorm2d(64), nn.LeakyReLU(0.1),
@@ -78,15 +134,99 @@ class YOLO(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x).permute(0, 2, 3, 1)
+        batch_size = x.shape[0]
+        out = self.net(x)  # (B, num_anchors*(5+nc), 13, 13)
+
+        # Reshape to (B, 13, 13, num_anchors, 5+nc)
+        out = out.view(batch_size, self.num_anchors, 5 + self.num_classes,
+                      self.grid_size, self.grid_size)
+        out = out.permute(0, 3, 4, 1, 2).contiguous()
+
+        return out
+
+def ciou_loss(pred_boxes, target_boxes, eps=1e-7):
+    """
+    Complete IoU loss.
+
+    Args:
+        pred_boxes: (N, 4) - predicted boxes (x, y, w, h) in normalized coords
+        target_boxes: (N, 4) - target boxes (x, y, w, h) in normalized coords
+
+    Returns:
+        CIoU loss value
+    """
+    # Extract coordinates
+    pred_x, pred_y, pred_w, pred_h = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
+    target_x, target_y, target_w, target_h = target_boxes[:, 0], target_boxes[:, 1], target_boxes[:, 2], target_boxes[:, 3]
+
+    # Convert to corner format
+    pred_x1 = pred_x - pred_w / 2
+    pred_y1 = pred_y - pred_h / 2
+    pred_x2 = pred_x + pred_w / 2
+    pred_y2 = pred_y + pred_h / 2
+
+    target_x1 = target_x - target_w / 2
+    target_y1 = target_y - target_h / 2
+    target_x2 = target_x + target_w / 2
+    target_y2 = target_y + target_h / 2
+
+    # Intersection area
+    inter_x1 = torch.max(pred_x1, target_x1)
+    inter_y1 = torch.max(pred_y1, target_y1)
+    inter_x2 = torch.min(pred_x2, target_x2)
+    inter_y2 = torch.min(pred_y2, target_y2)
+
+    inter_w = torch.clamp(inter_x2 - inter_x1, min=0)
+    inter_h = torch.clamp(inter_y2 - inter_y1, min=0)
+    inter_area = inter_w * inter_h
+
+    # Union area
+    pred_area = pred_w * pred_h
+    target_area = target_w * target_h
+    union_area = pred_area + target_area - inter_area
+
+    # IoU
+    iou = inter_area / (union_area + eps)
+
+    # Center distance
+    center_dist = (pred_x - target_x) ** 2 + (pred_y - target_y) ** 2
+
+    # Diagonal length of smallest enclosing box
+    enclose_x1 = torch.min(pred_x1, target_x1)
+    enclose_y1 = torch.min(pred_y1, target_y1)
+    enclose_x2 = torch.max(pred_x2, target_x2)
+    enclose_y2 = torch.max(pred_y2, target_y2)
+
+    enclose_w = enclose_x2 - enclose_x1
+    enclose_h = enclose_y2 - enclose_y1
+    enclose_diagonal = enclose_w ** 2 + enclose_h ** 2 + eps
+
+    # Distance penalty
+    distance_penalty = center_dist / enclose_diagonal
+
+    # Aspect ratio consistency
+    arctan_pred = torch.atan(pred_w / (pred_h + eps))
+    arctan_target = torch.atan(target_w / (target_h + eps))
+    v = (4 / (torch.pi ** 2)) * torch.pow(arctan_pred - arctan_target, 2)
+
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + eps)
+
+    # CIoU
+    ciou = iou - distance_penalty - alpha * v
+
+    # Loss is 1 - CIoU
+    loss = 1 - ciou
+
+    return loss.mean()
 
 def yolo_loss(predictions, targets, num_classes=1):
     """
-    Composite YOLO loss function.
+    Composite YOLO loss function with anchor support and CIoU.
 
     Args:
-        predictions: (batch, 13, 13, 5+nc) - model output
-        targets: (batch, 13, 13, 5+nc) - ground truth
+        predictions: (batch, 13, 13, num_anchors, 5+nc) - model output
+        targets: (batch, 13, 13, num_anchors, 5+nc) - ground truth
         num_classes: number of classes
 
     Returns:
@@ -101,19 +241,21 @@ def yolo_loss(predictions, targets, num_classes=1):
     target_obj = targets[..., 4:5]
     target_class = targets[..., 5:]
 
-    # Create mask for cells that contain objects
-    obj_mask = target_obj > 0.5  # (batch, 13, 13, 1)
+    # Create mask for cells+anchors that contain objects
+    obj_mask = target_obj > 0.5  # (batch, 13, 13, num_anchors, 1)
 
-    # 1. Bounding Box Loss (MSE, only for cells with objects)
+    # 1. Bounding Box Loss (CIoU, only for cells with objects)
     if obj_mask.sum() > 0:
-        bbox_loss = nn.MSELoss()(
-            pred_boxes[obj_mask.expand_as(pred_boxes)].view(-1),
-            target_boxes[obj_mask.expand_as(target_boxes)].view(-1)
-        )
+        # Extract boxes that have objects
+        pred_boxes_obj = pred_boxes[obj_mask.squeeze(-1)]  # (N, 4)
+        target_boxes_obj = target_boxes[obj_mask.squeeze(-1)]  # (N, 4)
+
+        # Use CIoU loss
+        bbox_loss = ciou_loss(pred_boxes_obj, target_boxes_obj)
     else:
         bbox_loss = torch.tensor(0.0, device=predictions.device)
 
-    # 2. Objectness Loss (BCEWithLogitsLoss, all cells)
+    # 2. Objectness Loss (BCEWithLogitsLoss, all cells+anchors)
     obj_loss = nn.BCEWithLogitsLoss()(pred_obj, target_obj)
 
     # 3. Class Loss (BCEWithLogitsLoss, only for cells with objects)
@@ -210,29 +352,30 @@ def eval_epoch(model, loader, device, num_classes=1, iou_threshold=0.5, conf_thr
             if num_classes > 0:
                 preds_eval[..., 5:] = torch.sigmoid(preds_eval[..., 5:])
 
-            # Evaluate each image in batch
+            # Evaluate each image in batch (now with anchor dimension)
             for b in range(preds.shape[0]):
                 for i in range(13):
                     for j in range(13):
-                        pred_obj = preds_eval[b, i, j, 4].item()
-                        target_obj = targets[b, i, j, 4].item()
+                        for a in range(preds.shape[3]):  # Iterate over anchors
+                            pred_obj = preds_eval[b, i, j, a, 4].item()
+                            target_obj = targets[b, i, j, a, 4].item()
 
-                        if pred_obj > conf_threshold and target_obj > conf_threshold:
-                            # Both predict and target have object - check IoU
-                            pred_box = preds_eval[b, i, j, 0:4]
-                            target_box = targets[b, i, j, 0:4]
-                            iou = compute_box_iou(pred_box, target_box)
+                            if pred_obj > conf_threshold and target_obj > conf_threshold:
+                                # Both predict and target have object - check IoU
+                                pred_box = preds_eval[b, i, j, a, 0:4]
+                                target_box = targets[b, i, j, a, 0:4]
+                                iou = compute_box_iou(pred_box, target_box)
 
-                            if iou > iou_threshold:
-                                true_positives += 1
-                            else:
+                                if iou > iou_threshold:
+                                    true_positives += 1
+                                else:
+                                    false_positives += 1
+                            elif pred_obj > conf_threshold and target_obj <= conf_threshold:
+                                # False positive: predicted object but no ground truth
                                 false_positives += 1
-                        elif pred_obj > conf_threshold and target_obj <= conf_threshold:
-                            # False positive: predicted object but no ground truth
-                            false_positives += 1
-                        elif pred_obj <= conf_threshold and target_obj > conf_threshold:
-                            # False negative: missed detection
-                            false_negatives += 1
+                            elif pred_obj <= conf_threshold and target_obj > conf_threshold:
+                                # False negative: missed detection
+                                false_negatives += 1
 
     # Calculate metrics
     precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
@@ -318,7 +461,7 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     img = img.unsqueeze(0).to(device)  # Add batch dimension
 
     with torch.no_grad():
-        preds = model(img)  # (1, 13, 13, 5+nc)
+        preds = model(img)  # (1, 13, 13, num_anchors, 5+nc)
 
     # Apply sigmoid to objectness and class predictions
     preds[..., 4] = torch.sigmoid(preds[..., 4])
@@ -326,48 +469,50 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
         preds[..., 5:] = torch.sigmoid(preds[..., 5:])
 
     detections = []
+    num_anchors = preds.shape[3]
 
-    # Convert grid predictions to image coordinates
+    # Convert grid predictions to image coordinates (iterate over anchors too)
     for i in range(13):
         for j in range(13):
-            obj_conf = preds[0, i, j, 4].item()
+            for a in range(num_anchors):  # Iterate over all anchors
+                obj_conf = preds[0, i, j, a, 4].item()
 
-            if obj_conf > conf_threshold:
-                x_center = preds[0, i, j, 0].item()
-                y_center = preds[0, i, j, 1].item()
-                width = preds[0, i, j, 2].item()
-                height = preds[0, i, j, 3].item()
+                if obj_conf > conf_threshold:
+                    x_center = preds[0, i, j, a, 0].item()
+                    y_center = preds[0, i, j, a, 1].item()
+                    width = preds[0, i, j, a, 2].item()
+                    height = preds[0, i, j, a, 3].item()
 
-                # Get class prediction
-                if num_classes == 1:
-                    class_prob = preds[0, i, j, 5].item()
-                    class_id = 0
-                else:
-                    class_probs = preds[0, i, j, 5:].cpu().numpy()
-                    class_id = int(class_probs.argmax())
-                    class_prob = class_probs[class_id]
+                    # Get class prediction
+                    if num_classes == 1:
+                        class_prob = preds[0, i, j, a, 5].item()
+                        class_id = 0
+                    else:
+                        class_probs = preds[0, i, j, a, 5:].cpu().numpy()
+                        class_id = int(class_probs.argmax())
+                        class_prob = class_probs[class_id]
 
-                # Convert to pixel coordinates (0-416)
-                x_center_px = x_center * 416
-                y_center_px = y_center * 416
-                width_px = width * 416
-                height_px = height * 416
+                    # Convert to pixel coordinates (0-416)
+                    x_center_px = x_center * 416
+                    y_center_px = y_center * 416
+                    width_px = width * 416
+                    height_px = height * 416
 
-                # Convert to corner format
-                x1 = x_center_px - width_px / 2
-                y1 = y_center_px - height_px / 2
-                x2 = x_center_px + width_px / 2
-                y2 = y_center_px + height_px / 2
+                    # Convert to corner format
+                    x1 = x_center_px - width_px / 2
+                    y1 = y_center_px - height_px / 2
+                    x2 = x_center_px + width_px / 2
+                    y2 = y_center_px + height_px / 2
 
-                # Scale back to original image size
-                x1 = (x1 / 416) * orig_w
-                y1 = (y1 / 416) * orig_h
-                x2 = (x2 / 416) * orig_w
-                y2 = (y2 / 416) * orig_h
+                    # Scale back to original image size
+                    x1 = (x1 / 416) * orig_w
+                    y1 = (y1 / 416) * orig_h
+                    x2 = (x2 / 416) * orig_w
+                    y2 = (y2 / 416) * orig_h
 
-                # Combined confidence
-                conf = obj_conf * class_prob
-                detections.append((x1, y1, x2, y2, conf, class_id))
+                    # Combined confidence
+                    conf = obj_conf * class_prob
+                    detections.append((x1, y1, x2, y2, conf, class_id))
 
     # Apply NMS
     detections = nms(detections, iou_threshold)
@@ -393,7 +538,7 @@ if __name__ == "__main__":
     model = YOLO(num_classes=num_classes).to(device)
 
     if pt_file and not yaml_file and not image_file:
-        # Inspect mode: python yolo.py model.pt
+        # Inspect mode: python train.py model.pt
         checkpoint = torch.load(pt_file, map_location=device)
         model.load_state_dict(checkpoint['model'])
         print(f"Model loaded from {pt_file}")
@@ -405,7 +550,7 @@ if __name__ == "__main__":
         print(f"\nTotal parameters: {total_params:,}")
 
     elif image_file and pt_file:
-        # Inference mode: python yolo.py image.jpg model.pt
+        # Inference mode: python train.py image.jpg model.pt
         checkpoint = torch.load(pt_file, map_location=device)
         model.load_state_dict(checkpoint['model'])
         print(f"Running inference on {image_file}")
@@ -421,7 +566,7 @@ if __name__ == "__main__":
                 print(f"  {i+1}. Box: ({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}), "
                       f"Confidence: {conf:.3f}, Class: {int(class_id)}")
 
-    elif yaml_file:
+    elif yaml_file and config is not None:
         # Training or evaluation mode
         train_loader = DataLoader(YOLODataset(config['train'], num_classes=num_classes),
                                    batch_size=8, shuffle=True)
@@ -429,7 +574,7 @@ if __name__ == "__main__":
                                 batch_size=8)
 
         if pt_file:
-            # Eval mode: python yolo.py data.yaml model.pt
+            # Eval mode: python train.py data.yaml model.pt
             checkpoint = torch.load(pt_file, map_location=device)
             model.load_state_dict(checkpoint['model'])
             print(f"Evaluating model from {pt_file}")
@@ -450,7 +595,7 @@ if __name__ == "__main__":
             print(f"  Recall: {val_rec:.2f}%")
             print(f"  F1 Score: {val_f1:.2f}%")
         else:
-            # Train mode: python yolo.py data.yaml
+            # Train mode: python train.py data.yaml
             print(f"Training YOLO model")
             print(f"Number of classes: {num_classes}")
             print(f"Training images: {len(train_loader.dataset)}")
@@ -474,7 +619,7 @@ if __name__ == "__main__":
             print(f"\nTraining complete. Model saved to {save_path}")
     else:
         print("Usage:")
-        print("  Training:     python yolo.py data.yaml")
-        print("  Evaluation:   python yolo.py data.yaml model.pt")
-        print("  Inference:    python yolo.py image.jpg model.pt")
-        print("  Inspect:      python yolo.py model.pt")
+        print("  Training:     python train.py data.yaml")
+        print("  Evaluation:   python train.py data.yaml model.pt")
+        print("  Inference:    python train.py image.jpg model.pt")
+        print("  Inspect:      python train.py model.pt")

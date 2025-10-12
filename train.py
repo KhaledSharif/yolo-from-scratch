@@ -17,14 +17,33 @@ class YOLODataset(Dataset):
         self.labels = [p.replace('/images/', '/labels/').rsplit('.', 1)[0] + '.txt' for p in self.imgs]
         self.num_classes = num_classes
         self.img_size = img_size
-        self.grid_size = img_size // 32  # 5 stride-2 convs = 32× downsample
 
-        # Default anchors (width, height in pixels)
+        # Multi-scale grid sizes
+        self.grid_size_p3 = img_size // 8   # Stride 8
+        self.grid_size_p4 = img_size // 16  # Stride 16
+        self.grid_size_p5 = img_size // 32  # Stride 32
+        self.grid_sizes = [self.grid_size_p3, self.grid_size_p4, self.grid_size_p5]
+        self.strides = [8, 16, 32]
+
+        # Multi-scale anchors: [P3, P4, P5]
         if anchors is None:
-            anchors = [[10, 13], [16, 30], [33, 23]]
+            anchors_p3 = [[10, 13], [16, 30], [33, 23]]      # Small objects
+            anchors_p4 = [[30, 61], [62, 45], [59, 119]]     # Medium objects
+            anchors_p5 = [[116, 90], [156, 198], [373, 326]] # Large objects
+            self.anchors = [
+                torch.tensor(anchors_p3, dtype=torch.float32),
+                torch.tensor(anchors_p4, dtype=torch.float32),
+                torch.tensor(anchors_p5, dtype=torch.float32)
+            ]
+        else:
+            # If custom anchors provided, expect list of 3 anchor sets
+            if isinstance(anchors[0][0], list):
+                self.anchors = [torch.tensor(a, dtype=torch.float32) for a in anchors]
+            else:
+                # Single anchor set provided (backward compatibility)
+                self.anchors = [torch.tensor(anchors, dtype=torch.float32)] * 3
 
-        self.anchors = torch.tensor(anchors, dtype=torch.float32)
-        self.num_anchors = len(anchors)
+        self.num_anchors_per_scale = 3  # 3 anchors per scale
         self.output_dim = 5 + num_classes  # x, y, w, h, objectness + class probs
 
     def __len__(self):
@@ -60,8 +79,12 @@ class YOLODataset(Dataset):
         pil_img = Image.open(self.imgs[idx]).convert('RGB').resize((self.img_size, self.img_size))
         img = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
 
-        # Initialize empty target (grid_size x grid_size x num_anchors x output_dim)
-        target = torch.zeros((self.grid_size, self.grid_size, self.num_anchors, self.output_dim))
+        # Initialize empty targets for all three scales
+        targets = [
+            torch.zeros((self.grid_sizes[0], self.grid_sizes[0], self.num_anchors_per_scale, self.output_dim)),  # P3
+            torch.zeros((self.grid_sizes[1], self.grid_sizes[1], self.num_anchors_per_scale, self.output_dim)),  # P4
+            torch.zeros((self.grid_sizes[2], self.grid_sizes[2], self.num_anchors_per_scale, self.output_dim))   # P5
+        ]
 
         # Load all boxes from label file
         if Path(self.labels[idx]).exists():
@@ -72,26 +95,37 @@ class YOLODataset(Dataset):
                         class_id = int(float(parts[0]))
                         x_center, y_center, width, height = [float(x) for x in parts[1:]]
 
-                        # Determine which grid cell is responsible
-                        grid_x = int(x_center * self.grid_size)
-                        grid_y = int(y_center * self.grid_size)
-
-                        # Clamp to valid range
-                        grid_x = min(grid_x, self.grid_size - 1)
-                        grid_y = min(grid_y, self.grid_size - 1)
-
                         # Convert box dimensions to pixels
                         box_w_px = width * self.img_size
                         box_h_px = height * self.img_size
                         box_wh = torch.tensor([box_w_px, box_h_px])
 
-                        # Find best matching anchor
-                        ious = self.compute_anchor_iou(box_wh, self.anchors)
-                        best_anchor_idx = torch.argmax(ious).item()
+                        # Find best matching anchor across ALL scales
+                        best_iou = -1
+                        best_scale_idx = 0
+                        best_anchor_idx = 0
+
+                        for scale_idx in range(3):
+                            ious = self.compute_anchor_iou(box_wh, self.anchors[scale_idx])
+                            max_iou = ious.max().item()
+                            if max_iou > best_iou:
+                                best_iou = max_iou
+                                best_scale_idx = scale_idx
+                                best_anchor_idx = ious.argmax().item()
+
+                        # Determine which grid cell is responsible at the selected scale
+                        grid_size = self.grid_sizes[best_scale_idx]
+                        grid_x = int(x_center * grid_size)
+                        grid_y = int(y_center * grid_size)
+
+                        # Clamp to valid range
+                        grid_x = min(grid_x, grid_size - 1)
+                        grid_y = min(grid_y, grid_size - 1)
 
                         # Only assign if this cell+anchor doesn't already have an object
+                        target = targets[best_scale_idx]
                         if target[grid_y, grid_x, best_anchor_idx, 4] == 0:
-                            # Set bounding box coordinates
+                            # Set bounding box coordinates (normalized to [0,1])
                             target[grid_y, grid_x, best_anchor_idx, 0:4] = torch.tensor(
                                 [x_center, y_center, width, height]
                             )
@@ -104,7 +138,22 @@ class YOLODataset(Dataset):
                                 # For multi-class, use one-hot encoding
                                 target[grid_y, grid_x, best_anchor_idx, 5 + class_id] = 1.0
 
-        return img, target
+        return img, targets
+
+def yolo_collate_fn(batch):
+    """
+    Custom collate function for DataLoader to handle multi-scale targets.
+
+    Args:
+        batch: List of (image, targets) tuples where targets is [target_p3, target_p4, target_p5]
+
+    Returns:
+        images: Batched images tensor (B, C, H, W)
+        targets: List of target lists (one per sample in batch)
+    """
+    images = torch.stack([item[0] for item in batch])
+    targets = [item[1] for item in batch]  # Keep as list of lists
+    return images, targets
 
 class SPPF(nn.Module):
     """
@@ -135,17 +184,79 @@ class SPPF(nn.Module):
         out = torch.cat([x, y1, y2, y3], dim=1)
         return self.act(self.bn2(self.conv2(out)))
 
+class ConvBlock(nn.Module):
+    """
+    Basic convolutional block: Conv2d + BatchNorm + SiLU activation.
+    Used as building block throughout the FPN architecture.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1, padding=0):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+class C3(nn.Module):
+    """
+    CSP Bottleneck with 3 convolutions (YOLOv5 C3 module).
+    Provides richer feature extraction with residual connections.
+
+    Args:
+        in_channels: Input channels
+        out_channels: Output channels
+        n: Number of bottleneck blocks (default 1)
+        shortcut: Whether to use shortcut connection (default True)
+    """
+    def __init__(self, in_channels, out_channels, n=1, shortcut=True):
+        super().__init__()
+        hidden_channels = out_channels // 2
+        self.conv1 = ConvBlock(in_channels, hidden_channels, 1, 1, 0)
+        self.conv2 = ConvBlock(in_channels, hidden_channels, 1, 1, 0)
+        self.conv3 = ConvBlock(2 * hidden_channels, out_channels, 1, 1, 0)
+        self.bottlenecks = nn.Sequential(
+            *[Bottleneck(hidden_channels, hidden_channels, shortcut) for _ in range(n)]
+        )
+
+    def forward(self, x):
+        # Split into two paths
+        x1 = self.bottlenecks(self.conv1(x))
+        x2 = self.conv2(x)
+        # Concatenate and project
+        return self.conv3(torch.cat([x1, x2], dim=1))
+
+class Bottleneck(nn.Module):
+    """
+    Standard bottleneck block used in C3.
+    """
+    def __init__(self, in_channels, out_channels, shortcut=True):
+        super().__init__()
+        self.conv1 = ConvBlock(in_channels, out_channels, 3, 1, 1)
+        self.conv2 = ConvBlock(out_channels, out_channels, 3, 1, 1)
+        self.shortcut = shortcut and in_channels == out_channels
+
+    def forward(self, x):
+        return x + self.conv2(self.conv1(x)) if self.shortcut else self.conv2(self.conv1(x))
+
 class YOLO(nn.Module):
     """
-    YOLO object detection model with YOLOv5-style offset prediction.
+    YOLO object detection model with YOLOv5-style FPN multi-scale detection.
 
-    The model outputs ENCODED predictions (t_x, t_y, t_w, t_h) that must be decoded
-    to absolute coordinates before use. See decode_predictions() function.
+    The model outputs ENCODED predictions (t_x, t_y, t_w, t_h) at three scales
+    that must be decoded to absolute coordinates. See decode_predictions() function.
 
     Architecture:
-    - 5 stride-2 conv layers reduce 416x416 input to 13x13 feature map
-    - Detection head outputs: num_anchors * (5 + num_classes) channels per grid cell
+    - Backbone: 5 stride-2 conv layers extracting features at 3 scales
+    - FPN Neck: Top-down pathway with lateral connections + PANet bottom-up
+    - 3 Detection Heads: P3 (stride 8), P4 (stride 16), P5 (stride 32)
+    - Each head outputs: num_anchors * (5 + num_classes) channels per grid cell
     - Each anchor predicts: t_x, t_y, t_w, t_h (offsets), objectness, class_probs
+
+    Multi-scale detection:
+    - P3 (stride 8): 80×80 grid @ 640px - small objects
+    - P4 (stride 16): 40×40 grid @ 640px - medium objects
+    - P5 (stride 32): 20×20 grid @ 640px - large objects
 
     Decoding formulas (applied in decode_predictions):
     - b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_size
@@ -160,50 +271,146 @@ class YOLO(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.img_size = img_size
-        self.grid_size = img_size // 32  # 5 stride-2 convs = 2^5 = 32 downsample
 
-        # Default anchors (width, height in pixels)
-        # Optimized for cone-like objects at different scales
+        # Grid sizes for three scales
+        self.grid_size_p3 = img_size // 8   # Stride 8 (e.g., 640 -> 80)
+        self.grid_size_p4 = img_size // 16  # Stride 16 (e.g., 640 -> 40)
+        self.grid_size_p5 = img_size // 32  # Stride 32 (e.g., 640 -> 20)
+        # For backward compatibility
+        self.grid_size = self.grid_size_p5
+
+        # Multi-scale anchors: small, medium, large
         if anchors is None:
-            anchors = [[10, 13], [16, 30], [33, 23]]
+            anchors_p3 = [[10, 13], [16, 30], [33, 23]]      # Small objects
+            anchors_p4 = [[30, 61], [62, 45], [59, 119]]     # Medium objects
+            anchors_p5 = [[116, 90], [156, 198], [373, 326]] # Large objects
+            self.anchors = [
+                torch.tensor(anchors_p3, dtype=torch.float32),
+                torch.tensor(anchors_p4, dtype=torch.float32),
+                torch.tensor(anchors_p5, dtype=torch.float32)
+            ]
+        else:
+            # If custom anchors provided, expect list of 3 anchor sets
+            if isinstance(anchors[0][0], list):
+                self.anchors = [torch.tensor(a, dtype=torch.float32) for a in anchors]
+            else:
+                # Single anchor set provided (backward compatibility)
+                self.anchors = [torch.tensor(anchors, dtype=torch.float32)] * 3
 
-        self.anchors = torch.tensor(anchors, dtype=torch.float32)
-        self.num_anchors = len(anchors)
+        self.num_anchors = 3  # 3 anchors per scale
 
-        # Output: num_anchors * (5 + num_classes) per grid cell
-        # Each anchor predicts: t_x, t_y, t_w, t_h (OFFSETS), objectness_logit, class_logits
+        # Output channels per detection head: num_anchors * (5 + num_classes)
         self.output_channels = self.num_anchors * (5 + num_classes)
 
-        # Backbone: 5 stride-2 conv layers with SiLU activation (YOLOv5 standard)
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.SiLU(),
-            nn.Conv2d(32, 64, 3, 2, 1), nn.BatchNorm2d(64), nn.SiLU(),
-            nn.Conv2d(64, 128, 3, 2, 1), nn.BatchNorm2d(128), nn.SiLU(),
-            nn.Conv2d(128, 256, 3, 2, 1), nn.BatchNorm2d(256), nn.SiLU(),
-            nn.Conv2d(256, 512, 3, 2, 1), nn.BatchNorm2d(512), nn.SiLU(),
+        # ===== BACKBONE =====
+        # Layer 1: 3 -> 32, stride 2
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.SiLU()
+        )
+        # Layer 2: 32 -> 64, stride 2
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, 2, 1), nn.BatchNorm2d(64), nn.SiLU()
+        )
+        # Layer 3: 64 -> 128, stride 2 (total stride 8) -> P3
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, 2, 1), nn.BatchNorm2d(128), nn.SiLU()
+        )
+        # Layer 4: 128 -> 256, stride 2 (total stride 16) -> P4
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, 2, 1), nn.BatchNorm2d(256), nn.SiLU()
+        )
+        # Layer 5: 256 -> 512, stride 2 (total stride 32) -> P5
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(256, 512, 3, 2, 1), nn.BatchNorm2d(512), nn.SiLU()
         )
 
-        # SPPF: Spatial Pyramid Pooling - Fast (YOLOv5 feature)
+        # SPPF on P5
         self.sppf = SPPF(512, 512)
 
-        # Detection head: 1x1 conv to output channels
-        self.head = nn.Conv2d(512, self.output_channels, 1)
+        # ===== FPN NECK (Top-Down) =====
+        # Lateral connections (reduce channels if needed)
+        self.lateral_p4 = ConvBlock(256, 256, 1, 1, 0)  # P4 lateral
+        self.lateral_p3 = ConvBlock(128, 128, 1, 1, 0)  # P3 lateral
+
+        # Top-down pathway
+        # P5 -> P4: Upsample + merge
+        self.upsample_p5_to_p4 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.reduce_p5_for_p4 = ConvBlock(512, 256, 1, 1, 0)  # Match P4 channels
+        self.merge_p4 = C3(512, 256, n=1)  # After concat(P5_up, P4) = 512 channels
+
+        # P4 -> P3: Upsample + merge
+        self.upsample_p4_to_p3 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.reduce_p4_for_p3 = ConvBlock(256, 128, 1, 1, 0)  # Match P3 channels
+        self.merge_p3 = C3(256, 128, n=1)  # After concat(P4_up, P3) = 256 channels
+
+        # ===== PANet (Bottom-Up) =====
+        # P3 -> P4: Downsample + merge
+        self.downsample_p3_to_p4 = ConvBlock(128, 128, 3, 2, 1)  # Stride 2
+        self.panet_merge_p4 = C3(384, 256, n=1)  # After concat(P3_down, P4) = 128+256 = 384
+
+        # P4 -> P5: Downsample + merge
+        self.downsample_p4_to_p5 = ConvBlock(256, 256, 3, 2, 1)  # Stride 2
+        self.panet_merge_p5 = C3(768, 512, n=1)  # After concat(P4_down, P5) = 256+512 = 768
+
+        # ===== DETECTION HEADS =====
+        self.head_p3 = nn.Conv2d(128, self.output_channels, 1)  # Stride 8
+        self.head_p4 = nn.Conv2d(256, self.output_channels, 1)  # Stride 16
+        self.head_p5 = nn.Conv2d(512, self.output_channels, 1)  # Stride 32
 
     def forward(self, x):
         batch_size = x.shape[0]
-        # Backbone: feature extraction
-        x = self.backbone(x)  # (B, 512, grid_size, grid_size)
-        # SPPF: multi-scale pooling
-        x = self.sppf(x)  # (B, 512, grid_size, grid_size)
-        # Detection head
-        out = self.head(x)  # (B, num_anchors*(5+nc), grid_size, grid_size)
 
-        # Reshape to (B, grid_size, grid_size, num_anchors, 5+nc)
-        out = out.view(batch_size, self.num_anchors, 5 + self.num_classes,
-                      self.grid_size, self.grid_size)
-        out = out.permute(0, 3, 4, 1, 2).contiguous()
+        # ===== BACKBONE: Extract multi-scale features =====
+        c1 = self.conv1(x)      # (B, 32, H/2, W/2)
+        c2 = self.conv2(c1)     # (B, 64, H/4, W/4)
+        p3_backbone = self.conv3(c2)   # (B, 128, H/8, W/8) - stride 8
+        p4_backbone = self.conv4(p3_backbone)  # (B, 256, H/16, W/16) - stride 16
+        p5_backbone = self.conv5(p4_backbone)  # (B, 512, H/32, W/32) - stride 32
+        p5_backbone = self.sppf(p5_backbone)   # (B, 512, H/32, W/32) with SPPF
 
-        return out
+        # ===== FPN: Top-down pathway =====
+        # Lateral connections
+        p4_lateral = self.lateral_p4(p4_backbone)  # (B, 256, H/16, W/16)
+        p3_lateral = self.lateral_p3(p3_backbone)  # (B, 128, H/8, W/8)
+
+        # P5 -> P4
+        p5_up = self.upsample_p5_to_p4(self.reduce_p5_for_p4(p5_backbone))  # (B, 256, H/16, W/16)
+        p4_fpn = self.merge_p4(torch.cat([p5_up, p4_lateral], dim=1))  # (B, 256, H/16, W/16)
+
+        # P4 -> P3
+        p4_up = self.upsample_p4_to_p3(self.reduce_p4_for_p3(p4_fpn))  # (B, 128, H/8, W/8)
+        p3_fpn = self.merge_p3(torch.cat([p4_up, p3_lateral], dim=1))  # (B, 128, H/8, W/8)
+
+        # ===== PANet: Bottom-up pathway =====
+        # P3 -> P4
+        p3_down = self.downsample_p3_to_p4(p3_fpn)  # (B, 128, H/16, W/16)
+        p4_panet = self.panet_merge_p4(torch.cat([p3_down, p4_fpn], dim=1))  # (B, 256, H/16, W/16)
+
+        # P4 -> P5
+        p4_down = self.downsample_p4_to_p5(p4_panet)  # (B, 256, H/32, W/32)
+        p5_panet = self.panet_merge_p5(torch.cat([p4_down, p5_backbone], dim=1))  # (B, 512, H/32, W/32)
+
+        # ===== DETECTION HEADS =====
+        # P3 head (stride 8)
+        out_p3 = self.head_p3(p3_fpn)  # (B, num_anchors*(5+nc), H/8, W/8)
+        out_p3 = out_p3.view(batch_size, self.num_anchors, 5 + self.num_classes,
+                             self.grid_size_p3, self.grid_size_p3)
+        out_p3 = out_p3.permute(0, 3, 4, 1, 2).contiguous()  # (B, H/8, W/8, num_anchors, 5+nc)
+
+        # P4 head (stride 16)
+        out_p4 = self.head_p4(p4_panet)  # (B, num_anchors*(5+nc), H/16, W/16)
+        out_p4 = out_p4.view(batch_size, self.num_anchors, 5 + self.num_classes,
+                             self.grid_size_p4, self.grid_size_p4)
+        out_p4 = out_p4.permute(0, 3, 4, 1, 2).contiguous()  # (B, H/16, W/16, num_anchors, 5+nc)
+
+        # P5 head (stride 32)
+        out_p5 = self.head_p5(p5_panet)  # (B, num_anchors*(5+nc), H/32, W/32)
+        out_p5 = out_p5.view(batch_size, self.num_anchors, 5 + self.num_classes,
+                             self.grid_size_p5, self.grid_size_p5)
+        out_p5 = out_p5.permute(0, 3, 4, 1, 2).contiguous()  # (B, H/32, W/32, num_anchors, 5+nc)
+
+        # Return list of predictions at three scales
+        return [out_p3, out_p4, out_p5]
 
 def ciou_loss(pred_boxes, target_boxes, eps=1e-7):
     """
@@ -405,20 +612,61 @@ def yolo_loss(predictions, targets, anchors, num_classes=1):
 
     return total_loss, bbox_loss, obj_loss, class_loss
 
+def yolo_loss_multiscale(predictions, targets, anchors_list, num_classes=1):
+    """
+    Multi-scale YOLO loss function for FPN architecture.
+
+    Args:
+        predictions: List of [pred_p3, pred_p4, pred_p5]
+                    Each pred has shape (batch, grid_size, grid_size, num_anchors, 5+nc)
+        targets: List of [target_p3, target_p4, target_p5]
+                Each target has shape (batch, grid_size, grid_size, num_anchors, 5+nc)
+        anchors_list: List of [anchors_p3, anchors_p4, anchors_p5]
+                     Each anchors is (num_anchors, 2) tensor
+        num_classes: Number of classes
+
+    Returns:
+        total_loss, total_bbox_loss, total_obj_loss, total_class_loss (summed across scales)
+    """
+    total_loss = 0.0
+    total_bbox_loss = 0.0
+    total_obj_loss = 0.0
+    total_class_loss = 0.0
+
+    # Compute loss for each scale
+    for pred, target, anchors in zip(predictions, targets, anchors_list):
+        loss, bbox_loss, obj_loss, class_loss = yolo_loss(pred, target, anchors, num_classes)
+        total_loss += loss
+        total_bbox_loss += bbox_loss
+        total_obj_loss += obj_loss
+        total_class_loss += class_loss
+
+    return total_loss, total_bbox_loss, total_obj_loss, total_class_loss
+
 def train_epoch(model, loader, optimizer, device, num_classes=1):
     model.train()
     total_loss, total_bbox, total_obj, total_cls = 0, 0, 0, 0
 
-    # Get anchors from model for decoding predictions
-    anchors = model.anchors
+    # Get multi-scale anchors from model
+    anchors_list = model.anchors  # List of [anchors_p3, anchors_p4, anchors_p5]
 
     for imgs, targets in loader:
-        imgs, targets = imgs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        preds = model(imgs)
+        imgs = imgs.to(device)
 
-        # Use composite loss function (will decode predictions internally)
-        loss, bbox_loss, obj_loss, cls_loss = yolo_loss(preds, targets, anchors, num_classes)
+        # Targets is a list of [target_p3, target_p4, target_p5] per image
+        # Need to stack into batch dimension: [batch of p3, batch of p4, batch of p5]
+        targets_p3 = torch.stack([t[0] for t in targets]).to(device)  # (B, H/8, W/8, 3, 5+nc)
+        targets_p4 = torch.stack([t[1] for t in targets]).to(device)  # (B, H/16, W/16, 3, 5+nc)
+        targets_p5 = torch.stack([t[2] for t in targets]).to(device)  # (B, H/32, W/32, 3, 5+nc)
+        targets_batch = [targets_p3, targets_p4, targets_p5]
+
+        optimizer.zero_grad()
+        preds = model(imgs)  # Returns [pred_p3, pred_p4, pred_p5]
+
+        # Use multi-scale loss function
+        loss, bbox_loss, obj_loss, cls_loss = yolo_loss_multiscale(
+            preds, targets_batch, anchors_list, num_classes
+        )
 
         loss.backward()
         optimizer.step()
@@ -465,7 +713,7 @@ def compute_box_iou(box1, box2):
 
 def eval_epoch(model, loader, device, num_classes=1, iou_threshold=0.5, conf_threshold=0.5):
     """
-    Evaluate with IoU-based detection metrics (precision, recall, F1).
+    Evaluate with IoU-based detection metrics (precision, recall, F1) for multi-scale FPN.
     """
     model.eval()
     total_loss = 0
@@ -473,53 +721,63 @@ def eval_epoch(model, loader, device, num_classes=1, iou_threshold=0.5, conf_thr
     false_positives = 0
     false_negatives = 0
 
-    # Get anchors from model for decoding predictions
-    anchors = model.anchors
+    # Get multi-scale anchors from model
+    anchors_list = model.anchors  # List of [anchors_p3, anchors_p4, anchors_p5]
+    grid_sizes = [model.grid_size_p3, model.grid_size_p4, model.grid_size_p5]
 
     with torch.no_grad():
         for imgs, targets in loader:
-            imgs, targets = imgs.to(device), targets.to(device)
-            preds = model(imgs)
+            imgs = imgs.to(device)
 
-            # Calculate loss (will decode predictions internally)
-            loss, _, _, _ = yolo_loss(preds, targets, anchors, num_classes)
+            # Stack targets for all scales
+            targets_p3 = torch.stack([t[0] for t in targets]).to(device)
+            targets_p4 = torch.stack([t[1] for t in targets]).to(device)
+            targets_p5 = torch.stack([t[2] for t in targets]).to(device)
+            targets_batch = [targets_p3, targets_p4, targets_p5]
+
+            preds = model(imgs)  # Returns [pred_p3, pred_p4, pred_p5]
+
+            # Calculate loss
+            loss, _, _, _ = yolo_loss_multiscale(preds, targets_batch, anchors_list, num_classes)
             total_loss += loss.item()
 
-            # Decode predictions from offset format to absolute coordinates
-            preds_decoded = decode_predictions(preds, anchors)
+            # Evaluate predictions from all three scales
+            for scale_idx, (pred, target, anchors, grid_size) in enumerate(
+                zip(preds, targets_batch, anchors_list, grid_sizes)
+            ):
+                # Decode predictions from offset format to absolute coordinates
+                preds_decoded = decode_predictions(pred, anchors)
 
-            # Apply sigmoid to objectness and class predictions for evaluation
-            # Use RAW predictions for objectness/class (need to apply sigmoid)
-            preds_eval = preds_decoded.clone()
-            preds_eval[..., 4] = torch.sigmoid(preds[..., 4])
-            if num_classes > 0:
-                preds_eval[..., 5:] = torch.sigmoid(preds[..., 5:])
+                # Apply sigmoid to objectness and class predictions for evaluation
+                preds_eval = preds_decoded.clone()
+                preds_eval[..., 4] = torch.sigmoid(pred[..., 4])
+                if num_classes > 0:
+                    preds_eval[..., 5:] = torch.sigmoid(pred[..., 5:])
 
-            # Evaluate each image in batch (now with anchor dimension)
-            grid_size = model.grid_size
-            for b in range(preds.shape[0]):
-                for i in range(grid_size):
-                    for j in range(grid_size):
-                        for a in range(preds.shape[3]):  # Iterate over anchors
-                            pred_obj = preds_eval[b, i, j, a, 4].item()
-                            target_obj = targets[b, i, j, a, 4].item()
+                # Evaluate each image in batch
+                for b in range(pred.shape[0]):
+                    for i in range(grid_size):
+                        for j in range(grid_size):
+                            for a in range(pred.shape[3]):  # Iterate over anchors
+                                pred_obj = preds_eval[b, i, j, a, 4].item()
+                                target_obj = target[b, i, j, a, 4].item()
 
-                            if pred_obj > conf_threshold and target_obj > conf_threshold:
-                                # Both predict and target have object - check IoU
-                                pred_box = preds_eval[b, i, j, a, 0:4]
-                                target_box = targets[b, i, j, a, 0:4]
-                                iou = compute_box_iou(pred_box, target_box)
+                                if pred_obj > conf_threshold and target_obj > conf_threshold:
+                                    # Both predict and target have object - check IoU
+                                    pred_box = preds_eval[b, i, j, a, 0:4]
+                                    target_box = target[b, i, j, a, 0:4]
+                                    iou = compute_box_iou(pred_box, target_box)
 
-                                if iou > iou_threshold:
-                                    true_positives += 1
-                                else:
+                                    if iou > iou_threshold:
+                                        true_positives += 1
+                                    else:
+                                        false_positives += 1
+                                elif pred_obj > conf_threshold and target_obj <= conf_threshold:
+                                    # False positive: predicted object but no ground truth
                                     false_positives += 1
-                            elif pred_obj > conf_threshold and target_obj <= conf_threshold:
-                                # False positive: predicted object but no ground truth
-                                false_positives += 1
-                            elif pred_obj <= conf_threshold and target_obj > conf_threshold:
-                                # False negative: missed detection
-                                false_negatives += 1
+                                elif pred_obj <= conf_threshold and target_obj > conf_threshold:
+                                    # False negative: missed detection
+                                    false_negatives += 1
 
     # Calculate metrics
     precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
@@ -581,15 +839,15 @@ def nms(detections, iou_threshold):
 
 def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_threshold=0.4):
     """
-    Run inference on a single image with NMS.
+    Run multi-scale inference on a single image with global NMS.
 
     Args:
-        model: YOLO model
+        model: YOLO FPN model
         image_path: Path to input image
         device: torch device
         num_classes: Number of classes
         conf_threshold: Confidence threshold
-        iou_threshold: IoU threshold for NMS
+        iou_threshold: IoU threshold for global NMS
 
     Returns:
         List of detections [(x1, y1, x2, y2, conf, class_id), ...]
@@ -606,66 +864,71 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     img = img.unsqueeze(0).to(device)  # Add batch dimension
 
     with torch.no_grad():
-        preds = model(img)  # (1, grid_size, grid_size, num_anchors, 5+nc) - RAW outputs
+        preds = model(img)  # Returns [pred_p3, pred_p4, pred_p5]
 
-    # Decode predictions from offset format to absolute coordinates
-    preds_decoded = decode_predictions(preds, model.anchors, model.grid_size, img_size)
-
-    # Apply sigmoid to objectness and class predictions
-    # Use RAW predictions for sigmoid (not decoded)
-    preds_decoded[..., 4] = torch.sigmoid(preds[..., 4])
-    if num_classes > 0:
-        preds_decoded[..., 5:] = torch.sigmoid(preds[..., 5:])
+    # Multi-scale detection heads info
+    anchors_list = model.anchors  # [anchors_p3, anchors_p4, anchors_p5]
+    grid_sizes = [model.grid_size_p3, model.grid_size_p4, model.grid_size_p5]
 
     detections = []
-    num_anchors = preds.shape[3]
-    grid_size = model.grid_size
 
-    # Convert grid predictions to image coordinates (iterate over anchors too)
-    for i in range(grid_size):
-        for j in range(grid_size):
-            for a in range(num_anchors):  # Iterate over all anchors
-                obj_conf = preds_decoded[0, i, j, a, 4].item()
+    # Process each scale separately
+    for scale_idx, (pred, anchors, grid_size) in enumerate(zip(preds, anchors_list, grid_sizes)):
+        # Decode predictions from offset format to absolute coordinates
+        preds_decoded = decode_predictions(pred, anchors, grid_size, img_size)
 
-                if obj_conf > conf_threshold:
-                    # Extract DECODED coordinates (already in normalized [0,1] range)
-                    x_center = preds_decoded[0, i, j, a, 0].item()
-                    y_center = preds_decoded[0, i, j, a, 1].item()
-                    width = preds_decoded[0, i, j, a, 2].item()
-                    height = preds_decoded[0, i, j, a, 3].item()
+        # Apply sigmoid to objectness and class predictions
+        preds_decoded[..., 4] = torch.sigmoid(pred[..., 4])
+        if num_classes > 0:
+            preds_decoded[..., 5:] = torch.sigmoid(pred[..., 5:])
 
-                    # Get class prediction (use decoded predictions with sigmoid already applied)
-                    if num_classes == 1:
-                        class_prob = preds_decoded[0, i, j, a, 5].item()
-                        class_id = 0
-                    else:
-                        class_probs = preds_decoded[0, i, j, a, 5:].cpu().numpy()
-                        class_id = int(class_probs.argmax())
-                        class_prob = class_probs[class_id]
+        num_anchors = pred.shape[3]
 
-                    # Convert to pixel coordinates (0-img_size)
-                    x_center_px = x_center * img_size
-                    y_center_px = y_center * img_size
-                    width_px = width * img_size
-                    height_px = height * img_size
+        # Convert grid predictions to image coordinates
+        for i in range(grid_size):
+            for j in range(grid_size):
+                for a in range(num_anchors):
+                    obj_conf = preds_decoded[0, i, j, a, 4].item()
 
-                    # Convert to corner format
-                    x1 = x_center_px - width_px / 2
-                    y1 = y_center_px - height_px / 2
-                    x2 = x_center_px + width_px / 2
-                    y2 = y_center_px + height_px / 2
+                    if obj_conf > conf_threshold:
+                        # Extract DECODED coordinates (already in normalized [0,1] range)
+                        x_center = preds_decoded[0, i, j, a, 0].item()
+                        y_center = preds_decoded[0, i, j, a, 1].item()
+                        width = preds_decoded[0, i, j, a, 2].item()
+                        height = preds_decoded[0, i, j, a, 3].item()
 
-                    # Scale back to original image size
-                    x1 = (x1 / img_size) * orig_w
-                    y1 = (y1 / img_size) * orig_h
-                    x2 = (x2 / img_size) * orig_w
-                    y2 = (y2 / img_size) * orig_h
+                        # Get class prediction
+                        if num_classes == 1:
+                            class_prob = preds_decoded[0, i, j, a, 5].item()
+                            class_id = 0
+                        else:
+                            class_probs = preds_decoded[0, i, j, a, 5:].cpu().numpy()
+                            class_id = int(class_probs.argmax())
+                            class_prob = class_probs[class_id]
 
-                    # Combined confidence
-                    conf = obj_conf * class_prob
-                    detections.append((x1, y1, x2, y2, conf, class_id))
+                        # Convert to pixel coordinates (0-img_size)
+                        x_center_px = x_center * img_size
+                        y_center_px = y_center * img_size
+                        width_px = width * img_size
+                        height_px = height * img_size
 
-    # Apply NMS
+                        # Convert to corner format
+                        x1 = x_center_px - width_px / 2
+                        y1 = y_center_px - height_px / 2
+                        x2 = x_center_px + width_px / 2
+                        y2 = y_center_px + height_px / 2
+
+                        # Scale back to original image size
+                        x1 = (x1 / img_size) * orig_w
+                        y1 = (y1 / img_size) * orig_h
+                        x2 = (x2 / img_size) * orig_w
+                        y2 = (y2 / img_size) * orig_h
+
+                        # Combined confidence
+                        conf = obj_conf * class_prob
+                        detections.append((x1, y1, x2, y2, conf, class_id))
+
+    # Apply global NMS across all scales
     detections = nms(detections, iou_threshold)
 
     return detections
@@ -748,11 +1011,11 @@ if __name__ == "__main__":
             print(f"Number of classes: {num_classes}")
             print(f"Image size: {model.img_size}")
 
-        # Create dataloaders with correct img_size
+        # Create dataloaders with correct img_size and custom collate function
         train_loader = DataLoader(YOLODataset(config['train'], num_classes=num_classes, img_size=img_size),
-                                   batch_size=8, shuffle=True)
+                                   batch_size=8, shuffle=True, collate_fn=yolo_collate_fn)
         val_loader = DataLoader(YOLODataset(config['val'], num_classes=num_classes, img_size=img_size),
-                                batch_size=8)
+                                batch_size=8, collate_fn=yolo_collate_fn)
 
         if pt_file:
 

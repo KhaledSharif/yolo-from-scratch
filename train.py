@@ -11,6 +11,51 @@ import numpy as np
 import glob
 from datetime import datetime
 
+def letterbox_resize(image, target_size=640, pad_color=(114, 114, 114)):
+    """
+    Resize image with aspect ratio preservation (letterbox).
+
+    Instead of distorting the image, this function:
+    1. Scales the image to fit within target_size while preserving aspect ratio
+    2. Pads the remaining space with pad_color to create a square image
+
+    This prevents geometry distortion that breaks object detection accuracy.
+
+    Args:
+        image: PIL Image object
+        target_size: Target size for both width and height (creates square output)
+        pad_color: RGB tuple for padding color (default: gray 114,114,114)
+
+    Returns:
+        resized_image: PIL Image of size (target_size, target_size)
+        scale: Scale factor applied (for coordinate adjustment)
+        pad_top: Top padding in pixels
+        pad_left: Left padding in pixels
+    """
+    orig_w, orig_h = image.size
+
+    # Calculate scale to fit image in target_size while preserving aspect ratio
+    scale = min(target_size / orig_w, target_size / orig_h)
+
+    # New dimensions after scaling
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+
+    # Resize image (using high-quality resampling)
+    resized = image.resize((new_w, new_h), Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else 2)
+
+    # Create new image with padding
+    new_image = Image.new('RGB', (target_size, target_size), pad_color)
+
+    # Calculate padding to center the image
+    pad_left = (target_size - new_w) // 2
+    pad_top = (target_size - new_h) // 2
+
+    # Paste resized image onto padded canvas
+    new_image.paste(resized, (pad_left, pad_top))
+
+    return new_image, scale, pad_top, pad_left
+
 class YOLODataset(Dataset):
     def __init__(self, img_dir, num_classes=1, anchors=None, img_size=640):
         self.imgs = sorted(glob.glob(f"{img_dir}/*.jpg") + glob.glob(f"{img_dir}/*.png"))
@@ -75,8 +120,10 @@ class YOLODataset(Dataset):
         return iou
 
     def __getitem__(self, idx):
-        # Load and preprocess image
-        pil_img = Image.open(self.imgs[idx]).convert('RGB').resize((self.img_size, self.img_size))
+        # Load image and apply letterbox resize (preserves aspect ratio)
+        pil_img = Image.open(self.imgs[idx]).convert('RGB')
+        orig_w, orig_h = pil_img.size
+        pil_img, scale, pad_top, pad_left = letterbox_resize(pil_img, self.img_size)
         img = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
 
         # Initialize empty targets for all three scales
@@ -95,7 +142,15 @@ class YOLODataset(Dataset):
                         class_id = int(float(parts[0]))
                         x_center, y_center, width, height = [float(x) for x in parts[1:]]
 
-                        # Convert box dimensions to pixels
+                        # Adjust coordinates for letterbox resize
+                        # Convert from normalized [0,1] relative to original image
+                        # to normalized [0,1] relative to padded/scaled image
+                        x_center = (x_center * orig_w * scale + pad_left) / self.img_size
+                        y_center = (y_center * orig_h * scale + pad_top) / self.img_size
+                        width = (width * orig_w * scale) / self.img_size
+                        height = (height * orig_h * scale) / self.img_size
+
+                        # Convert box dimensions to pixels (relative to img_size after letterbox)
                         box_w_px = width * self.img_size
                         box_h_px = height * self.img_size
                         box_wh = torch.tensor([box_w_px, box_h_px])
@@ -353,9 +408,69 @@ class YOLO(nn.Module):
         self.panet_merge_p5 = C3(768, 512, n=1)  # After concat(P4_down, P5) = 256+512 = 768
 
         # ===== DETECTION HEADS =====
-        self.head_p3 = nn.Conv2d(128, self.output_channels, 1)  # Stride 8
-        self.head_p4 = nn.Conv2d(256, self.output_channels, 1)  # Stride 16
-        self.head_p5 = nn.Conv2d(512, self.output_channels, 1)  # Stride 32
+        # Stronger heads with 2 Conv blocks before final prediction (YOLOv5 style)
+        # This gives more capacity for feature refinement before detection
+        self.head_p3 = nn.Sequential(
+            ConvBlock(128, 128, 3, 1, 1),  # 3×3 conv
+            ConvBlock(128, 128, 3, 1, 1),  # 3×3 conv
+            nn.Conv2d(128, self.output_channels, 1)  # Final 1×1 prediction
+        )  # Stride 8
+        self.head_p4 = nn.Sequential(
+            ConvBlock(256, 256, 3, 1, 1),  # 3×3 conv
+            ConvBlock(256, 256, 3, 1, 1),  # 3×3 conv
+            nn.Conv2d(256, self.output_channels, 1)  # Final 1×1 prediction
+        )  # Stride 16
+        self.head_p5 = nn.Sequential(
+            ConvBlock(512, 512, 3, 1, 1),  # 3×3 conv
+            ConvBlock(512, 512, 3, 1, 1),  # 3×3 conv
+            nn.Conv2d(512, self.output_channels, 1)  # Final 1×1 prediction
+        )  # Stride 32
+
+        # Initialize detection head biases for training stability
+        self.initialize_detection_biases()
+
+    def initialize_detection_biases(self, prior=0.01):
+        """
+        Initialize detection head biases for stable training.
+
+        YOLOv5-style bias initialization:
+        - Objectness bias: Set to -log((1-prior)/prior) to start with low objectness predictions
+        - Class bias: Set to 0.0 (or can be based on class frequencies)
+
+        This prevents the model from predicting too many false positives early in training,
+        leading to faster convergence and better final accuracy.
+
+        Args:
+            prior: Initial objectness probability (default 0.01 = 1%)
+        """
+        import math
+
+        # Calculate objectness bias: -log((1-prior)/prior)
+        # For prior=0.01: -log(99) ≈ -4.595
+        # This makes sigmoid(bias) ≈ prior
+        obj_bias = -math.log((1 - prior) / prior)
+
+        # Initialize biases for all three detection heads
+        for head in [self.head_p3, self.head_p4, self.head_p5]:
+            # Each head is now an nn.Sequential; get the final Conv2d layer
+            final_conv = head[-1]  # Last layer in Sequential
+
+            # Each head outputs: num_anchors * (5 + num_classes) channels
+            # Layout per anchor: [tx, ty, tw, th, objectness, class1, class2, ...]
+            output_per_anchor = 5 + self.num_classes
+
+            with torch.no_grad():
+                bias = final_conv.bias.view(self.num_anchors, output_per_anchor)
+
+                # Initialize objectness bias (index 4) for each anchor
+                bias[:, 4].fill_(obj_bias)
+
+                # Initialize class biases (indices 5:) to 0.0
+                if self.num_classes > 0:
+                    bias[:, 5:].fill_(0.0)
+
+                # tx, ty, tw, th biases can stay at default initialization (near 0)
+                # This is fine as the decoding formulas have built-in offsets
 
     def forward(self, x):
         batch_size = x.shape[0]
@@ -393,20 +508,23 @@ class YOLO(nn.Module):
         # ===== DETECTION HEADS =====
         # P3 head (stride 8)
         out_p3 = self.head_p3(p3_fpn)  # (B, num_anchors*(5+nc), H/8, W/8)
-        out_p3 = out_p3.view(batch_size, self.num_anchors, 5 + self.num_classes,
-                             self.grid_size_p3, self.grid_size_p3)
+        # Derive grid size dynamically from tensor shape for robustness
+        _, _, h_p3, w_p3 = out_p3.shape
+        out_p3 = out_p3.view(batch_size, self.num_anchors, 5 + self.num_classes, h_p3, w_p3)
         out_p3 = out_p3.permute(0, 3, 4, 1, 2).contiguous()  # (B, H/8, W/8, num_anchors, 5+nc)
 
         # P4 head (stride 16)
         out_p4 = self.head_p4(p4_panet)  # (B, num_anchors*(5+nc), H/16, W/16)
-        out_p4 = out_p4.view(batch_size, self.num_anchors, 5 + self.num_classes,
-                             self.grid_size_p4, self.grid_size_p4)
+        # Derive grid size dynamically from tensor shape
+        _, _, h_p4, w_p4 = out_p4.shape
+        out_p4 = out_p4.view(batch_size, self.num_anchors, 5 + self.num_classes, h_p4, w_p4)
         out_p4 = out_p4.permute(0, 3, 4, 1, 2).contiguous()  # (B, H/16, W/16, num_anchors, 5+nc)
 
         # P5 head (stride 32)
         out_p5 = self.head_p5(p5_panet)  # (B, num_anchors*(5+nc), H/32, W/32)
-        out_p5 = out_p5.view(batch_size, self.num_anchors, 5 + self.num_classes,
-                             self.grid_size_p5, self.grid_size_p5)
+        # Derive grid size dynamically from tensor shape
+        _, _, h_p5, w_p5 = out_p5.shape
+        out_p5 = out_p5.view(batch_size, self.num_anchors, 5 + self.num_classes, h_p5, w_p5)
         out_p5 = out_p5.permute(0, 3, 4, 1, 2).contiguous()  # (B, H/32, W/32, num_anchors, 5+nc)
 
         # Return list of predictions at three scales
@@ -494,28 +612,26 @@ def decode_predictions(raw_preds, anchors, grid_size=None, img_size=640):
 
     Implements YOLOv5-style decoding where the network outputs offsets (t_x, t_y, t_w, t_h)
     that are transformed into absolute bounding box coordinates:
-    - Centers: b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_size
+    - Centers: b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_width
     - Dims: b_w = (anchor_w * (2 * σ(t_w))²) / img_size
 
     This constrains predictions to be near their responsible grid cell and scales
     dimensions relative to anchor size, improving training stability.
 
     Args:
-        raw_preds: (batch, grid_size, grid_size, num_anchors, 5+nc)
+        raw_preds: (batch, grid_h, grid_w, num_anchors, 5+nc)
                    Raw network outputs where first 4 values are t_x, t_y, t_w, t_h
         anchors: (num_anchors, 2) tensor of anchor dimensions [width, height] in pixels
-        grid_size: Size of detection grid (default 13)
-        img_size: Input image size in pixels (default 416)
+        grid_size: DEPRECATED - grid size now always derived from tensor shape
+        img_size: Input image size in pixels (default 640)
 
     Returns:
         decoded: Same shape as raw_preds but with first 4 values as absolute coordinates
                 (b_x, b_y, b_w, b_h) in normalized [0,1] range.
                 Objectness and class predictions remain as logits (unchanged).
     """
+    # Always derive grid dimensions from tensor shape (robust to any input size)
     _, h, w, num_anchors, _ = raw_preds.shape
-    # Infer grid_size from shape if not provided
-    if grid_size is None:
-        grid_size = h  # Assume square grid
     decoded = raw_preds.clone()
 
     # Create grid coordinate meshes
@@ -535,9 +651,10 @@ def decode_predictions(raw_preds, anchors, grid_size=None, img_size=640):
     # Decode center coordinates (x, y)
     # Sigmoid constrains offset to [0, 1], multiply by 2 and subtract 0.5 gives [-0.5, 1.5]
     # This allows the center to be up to 0.5 cells outside the responsible cell
-    # Formula: b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_size
-    decoded[..., 0] = ((torch.sigmoid(raw_preds[..., 0]) * 2.0 - 0.5) + grid_x) / grid_size
-    decoded[..., 1] = ((torch.sigmoid(raw_preds[..., 1]) * 2.0 - 0.5) + grid_y) / grid_size
+    # Formula: b_x = ((σ(t_x) * 2 - 0.5) + c_x) / grid_width
+    # Use actual grid dimensions (w for x, h for y) instead of assuming square
+    decoded[..., 0] = ((torch.sigmoid(raw_preds[..., 0]) * 2.0 - 0.5) + grid_x) / w
+    decoded[..., 1] = ((torch.sigmoid(raw_preds[..., 1]) * 2.0 - 0.5) + grid_y) / h
 
     # Decode dimensions (w, h)
     # Sigmoid constrains to [0, 1], multiply by 2 gives [0, 2], square gives [0, 4]
@@ -614,7 +731,12 @@ def yolo_loss(predictions, targets, anchors, num_classes=1):
 
 def yolo_loss_multiscale(predictions, targets, anchors_list, num_classes=1):
     """
-    Multi-scale YOLO loss function for FPN architecture.
+    Multi-scale YOLO loss function for FPN architecture with per-scale objectness weighting.
+
+    YOLOv5-style per-scale loss balancing:
+    - P3 has many cells (80×80 = 6400) → needs higher objectness weight to balance gradients
+    - P5 has few cells (20×20 = 400) → needs lower objectness weight
+    - Without balancing, P3's objectness loss would dominate training
 
     Args:
         predictions: List of [pred_p3, pred_p4, pred_p5]
@@ -626,19 +748,31 @@ def yolo_loss_multiscale(predictions, targets, anchors_list, num_classes=1):
         num_classes: Number of classes
 
     Returns:
-        total_loss, total_bbox_loss, total_obj_loss, total_class_loss (summed across scales)
+        total_loss, total_bbox_loss, total_obj_loss, total_class_loss (weighted sum across scales)
     """
+    # Per-scale objectness weights (balances gradient contributions)
+    # P3: 4.0× (many cells, small objects)
+    # P4: 1.0× (baseline)
+    # P5: 0.4× (few cells, large objects)
+    obj_weights = [4.0, 1.0, 0.4]
+
     total_loss = 0.0
     total_bbox_loss = 0.0
     total_obj_loss = 0.0
     total_class_loss = 0.0
 
-    # Compute loss for each scale
-    for pred, target, anchors in zip(predictions, targets, anchors_list):
+    # Compute loss for each scale with appropriate objectness weighting
+    for pred, target, anchors, obj_weight in zip(predictions, targets, anchors_list, obj_weights):
         loss, bbox_loss, obj_loss, class_loss = yolo_loss(pred, target, anchors, num_classes)
-        total_loss += loss
+
+        # Apply per-scale objectness weighting
+        # Decompose total loss: total_loss = 5.0*bbox + 1.0*obj + 1.0*cls
+        # Re-weight: total_loss = 5.0*bbox + obj_weight*obj + 1.0*cls
+        weighted_loss = 5.0 * bbox_loss + obj_weight * obj_loss + 1.0 * class_loss
+
+        total_loss += weighted_loss
         total_bbox_loss += bbox_loss
-        total_obj_loss += obj_loss
+        total_obj_loss += obj_loss  # Track unweighted for logging
         total_class_loss += class_loss
 
     return total_loss, total_bbox_loss, total_obj_loss, total_class_loss
@@ -889,11 +1023,11 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     """
     model.eval()
 
-    # Load and preprocess image
+    # Load and preprocess image with letterbox resize
     pil_img = Image.open(image_path).convert('RGB')
     orig_w, orig_h = pil_img.size
     img_size = model.img_size
-    pil_img = pil_img.resize((img_size, img_size))
+    pil_img, scale, pad_top, pad_left = letterbox_resize(pil_img, img_size)
     img = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
     img = img.unsqueeze(0).to(device)  # Add batch dimension
 
@@ -946,17 +1080,23 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
                         width_px = width * img_size
                         height_px = height * img_size
 
-                        # Convert to corner format
+                        # Convert to corner format (in letterbox coordinates)
                         x1 = x_center_px - width_px / 2
                         y1 = y_center_px - height_px / 2
                         x2 = x_center_px + width_px / 2
                         y2 = y_center_px + height_px / 2
 
-                        # Scale back to original image size
-                        x1 = (x1 / img_size) * orig_w
-                        y1 = (y1 / img_size) * orig_h
-                        x2 = (x2 / img_size) * orig_w
-                        y2 = (y2 / img_size) * orig_h
+                        # Reverse letterbox transformation to get original image coordinates
+                        # 1. Remove padding
+                        x1 = x1 - pad_left
+                        y1 = y1 - pad_top
+                        x2 = x2 - pad_left
+                        y2 = y2 - pad_top
+                        # 2. Undo scaling
+                        x1 = x1 / scale
+                        y1 = y1 / scale
+                        x2 = x2 / scale
+                        y2 = y2 / scale
 
                         # Combined confidence
                         conf = obj_conf * class_prob
@@ -966,6 +1106,98 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     detections = nms(detections, iou_threshold)
 
     return detections
+
+def compute_optimal_anchors(dataset_yaml, img_size=640, num_anchors=9):
+    """
+    Compute optimal anchors for a dataset using k-means clustering.
+
+    This analyzes all bounding boxes in the training set and finds anchor sizes
+    that best represent the distribution of object sizes. Better anchors lead to
+    faster convergence and higher accuracy.
+
+    Args:
+        dataset_yaml: Path to dataset YAML config file
+        img_size: Image size used for training (anchors scale with this)
+        num_anchors: Total number of anchors to generate (default 9, will be split 3/3/3 across scales)
+
+    Returns:
+        List of 3 anchor sets: [anchors_p3, anchors_p4, anchors_p5]
+        Each anchor set contains 3 anchors as [[w1, h1], [w2, h2], [w3, h3]]
+    """
+    # Import sklearn for k-means
+    try:
+        from sklearn.cluster import KMeans
+    except ImportError:
+        print("ERROR: scikit-learn is required for anchor clustering.")
+        print("Install with: pip install scikit-learn")
+        return None
+
+    # Load dataset configuration
+    with open(dataset_yaml) as f:
+        config = yaml.safe_load(f)
+
+    # Collect all box dimensions from training set
+    img_dir = config['train']
+    label_files = sorted(glob.glob(f"{img_dir.replace('/images/', '/labels/')}/*.txt"))
+
+    all_boxes = []
+    for label_file in label_files:
+        if Path(label_file).exists():
+            with open(label_file) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        # Extract width and height (normalized [0, 1])
+                        width = float(parts[3])
+                        height = float(parts[4])
+                        # Convert to pixels relative to img_size
+                        width_px = width * img_size
+                        height_px = height * img_size
+                        all_boxes.append([width_px, height_px])
+
+    if len(all_boxes) == 0:
+        print(f"ERROR: No boxes found in {img_dir}")
+        return None
+
+    all_boxes = np.array(all_boxes)
+    print(f"Loaded {len(all_boxes)} boxes from {len(label_files)} images")
+    print(f"Box size range: width [{all_boxes[:, 0].min():.1f}, {all_boxes[:, 0].max():.1f}], "
+          f"height [{all_boxes[:, 1].min():.1f}, {all_boxes[:, 1].max():.1f}]")
+
+    # Run k-means clustering
+    print(f"\nRunning k-means clustering with k={num_anchors}...")
+    kmeans = KMeans(n_clusters=num_anchors, random_state=0, n_init=10)
+    kmeans.fit(all_boxes)
+
+    # Get cluster centers (these are our anchors)
+    anchors = kmeans.cluster_centers_
+    anchors = anchors[np.argsort(anchors[:, 0] * anchors[:, 1])]  # Sort by area
+
+    print("\nOptimal anchors (sorted by area):")
+    for i, (w, h) in enumerate(anchors):
+        area = w * h
+        print(f"  Anchor {i+1}: [{w:.1f}, {h:.1f}] (area: {area:.0f})")
+
+    # Split into 3 scales (P3, P4, P5)
+    # Small objects (P3): first 3 anchors
+    # Medium objects (P4): middle 3 anchors
+    # Large objects (P5): last 3 anchors
+    anchors_p3 = anchors[0:3].round().astype(int).tolist()
+    anchors_p4 = anchors[3:6].round().astype(int).tolist()
+    anchors_p5 = anchors[6:9].round().astype(int).tolist()
+
+    print("\n" + "="*60)
+    print("Recommended anchor configuration:")
+    print("="*60)
+    print(f"P3 (small objects):  {anchors_p3}")
+    print(f"P4 (medium objects): {anchors_p4}")
+    print(f"P5 (large objects):  {anchors_p5}")
+    print("\nTo use these anchors, pass them to YOLO() and YOLODataset():")
+    print(f"  anchors = [{anchors_p3}, {anchors_p4}, {anchors_p5}]")
+    print(f"  model = YOLO(num_classes=..., anchors=anchors, img_size={img_size})")
+    print("="*60)
+
+    return [anchors_p3, anchors_p4, anchors_p5]
 
 if __name__ == "__main__":
     import argparse
@@ -978,6 +1210,7 @@ if __name__ == "__main__":
     parser.add_argument('--warmup-epochs', type=int, default=3, help='Number of warmup epochs (default: 3)')
     parser.add_argument('--min-lr', type=float, default=1e-4, help='Minimum learning rate (default: 0.0001)')
     parser.add_argument('--epochs', type=int, default=100, help='Total training epochs (default: 100)')
+    parser.add_argument('--compute-anchors', action='store_true', help='Compute optimal anchors for dataset using k-means')
     parsed_args = parser.parse_args()
 
     # Extract file types from positional arguments
@@ -987,6 +1220,16 @@ if __name__ == "__main__":
 
     img_size = parsed_args.img_size
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Handle --compute-anchors mode
+    if parsed_args.compute_anchors:
+        if not yaml_file:
+            print("ERROR: --compute-anchors requires a dataset YAML file")
+            print("Usage: python train.py dataset.yaml --compute-anchors [--img-size SIZE]")
+            sys.exit(1)
+        print(f"Computing optimal anchors for {yaml_file} at img_size={img_size}...")
+        compute_optimal_anchors(yaml_file, img_size=img_size)
+        sys.exit(0)
 
     # Determine num_classes from config if available
     num_classes = 1
@@ -1119,10 +1362,11 @@ if __name__ == "__main__":
             print(f"\nTraining complete. Model saved to {save_path}")
     else:
         print("Usage:")
-        print("  Training:     python train.py data.yaml [OPTIONS]")
-        print("  Evaluation:   python train.py data.yaml model.pt [--img-size SIZE]")
-        print("  Inference:    python train.py image.jpg model.pt [--img-size SIZE]")
-        print("  Inspect:      python train.py model.pt")
+        print("  Training:       python train.py data.yaml [OPTIONS]")
+        print("  Evaluation:     python train.py data.yaml model.pt [--img-size SIZE]")
+        print("  Inference:      python train.py image.jpg model.pt [--img-size SIZE]")
+        print("  Inspect:        python train.py model.pt")
+        print("  Compute Anchors: python train.py data.yaml --compute-anchors [--img-size SIZE]")
         print("")
         print("Options:")
         print("  --img-size SIZE        Input image size (default: 640)")
@@ -1131,3 +1375,4 @@ if __name__ == "__main__":
         print("  --min-lr LR            Minimum learning rate (default: 0.0001)")
         print("  --warmup-epochs N      Number of warmup epochs (default: 3)")
         print("  --epochs N             Total training epochs (default: 100)")
+        print("  --compute-anchors      Run k-means clustering to find optimal anchors for dataset")

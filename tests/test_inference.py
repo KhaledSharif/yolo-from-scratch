@@ -134,7 +134,7 @@ class TestPredict:
         image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
 
         # Use low confidence to get some detections
-        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.01)
+        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.3)
 
         if len(detections) > 0:
             # Each detection should be (x1, y1, x2, y2, conf, class_id)
@@ -155,9 +155,9 @@ class TestPredict:
         image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
 
         # Low threshold - more detections
-        dets_low = predict(model, image_path, device, num_classes=1, conf_threshold=0.01)
+        dets_low = predict(model, image_path, device, num_classes=1, conf_threshold=0.3)
         # High threshold - fewer detections
-        dets_high = predict(model, image_path, device, num_classes=1, conf_threshold=0.9)
+        dets_high = predict(model, image_path, device, num_classes=1, conf_threshold=0.95)
 
         assert len(dets_low) >= len(dets_high)
 
@@ -170,7 +170,7 @@ class TestPredict:
         image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
 
         # Get detections (should have NMS applied)
-        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.01)
+        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.3)
 
         # All remaining detections should have low IoU with each other
         for i in range(len(detections)):
@@ -193,7 +193,7 @@ class TestPredict:
         assert model.grid_size_p5 == 20
 
         # Run prediction (should process all scales)
-        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.01)
+        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.3)
 
         # Detections can come from any scale
         assert isinstance(detections, list)

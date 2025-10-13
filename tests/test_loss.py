@@ -159,7 +159,12 @@ class TestMultiScaleLoss:
 
         # All losses should be valid
         assert isinstance(total_loss, (torch.Tensor, float))
-        assert not torch.isnan(torch.tensor(total_loss))
+        # Check for NaN without copying tensor
+        if isinstance(total_loss, torch.Tensor):
+            assert not torch.isnan(total_loss)
+        else:
+            import math
+            assert not math.isnan(total_loss)
 
     def test_multiscale_loss_with_objects_at_different_scales(self):
         """Test multi-scale loss with objects at different scales."""
@@ -245,7 +250,7 @@ class TestDecodePredictions:
         raw_preds = torch.randn(2, 20, 20, 3, 6)
         anchors = torch.tensor([[10, 13], [16, 30], [33, 23]], dtype=torch.float32)
 
-        decoded = decode_predictions(raw_preds, anchors, grid_size=20, img_size=640)
+        decoded = decode_predictions(raw_preds, anchors, img_size=640)
 
         assert decoded.shape == raw_preds.shape
 
@@ -255,7 +260,7 @@ class TestDecodePredictions:
         raw_preds = torch.zeros(1, 20, 20, 3, 6)
         anchors = torch.tensor([[10, 13], [16, 30], [33, 23]], dtype=torch.float32)
 
-        decoded = decode_predictions(raw_preds, anchors, grid_size=20, img_size=640)
+        decoded = decode_predictions(raw_preds, anchors, img_size=640)
 
         # Decoded x and y should be in [0, 1]
         assert (decoded[..., 0] >= 0).all() and (decoded[..., 0] <= 1).all()
@@ -266,7 +271,7 @@ class TestDecodePredictions:
         raw_preds = torch.randn(1, 20, 20, 3, 6)
         anchors = torch.tensor([[10, 13], [16, 30], [33, 23]], dtype=torch.float32)
 
-        decoded = decode_predictions(raw_preds, anchors, grid_size=20, img_size=640)
+        decoded = decode_predictions(raw_preds, anchors, img_size=640)
 
         # Width and height should be positive
         assert (decoded[..., 2] > 0).all()
@@ -277,7 +282,7 @@ class TestDecodePredictions:
         raw_preds = torch.randn(1, 20, 20, 3, 6)
         anchors = torch.tensor([[10, 13], [16, 30], [33, 23]], dtype=torch.float32)
 
-        decoded = decode_predictions(raw_preds, anchors, grid_size=20, img_size=640)
+        decoded = decode_predictions(raw_preds, anchors, img_size=640)
 
         # Objectness and class predictions should be unchanged (still logits)
         assert torch.allclose(decoded[..., 4:], raw_preds[..., 4:])
@@ -288,18 +293,19 @@ class TestDecodePredictions:
 
         for grid_size in [20, 40, 80]:
             raw_preds = torch.randn(1, grid_size, grid_size, 3, 6)
-            decoded = decode_predictions(raw_preds, anchors, grid_size=grid_size, img_size=640)
+            decoded = decode_predictions(raw_preds, anchors, img_size=640)
 
             assert decoded.shape == raw_preds.shape
-            assert (decoded[..., 0] >= 0).all() and (decoded[..., 0] <= 1).all()
-            assert (decoded[..., 1] >= 0).all() and (decoded[..., 1] <= 1).all()
+            # YOLOv5 decoding allows centers to extend ~0.5 cells outside [0,1] for better boundary predictions
+            assert (decoded[..., 0] >= -0.1).all() and (decoded[..., 0] <= 1.1).all()
+            assert (decoded[..., 1] >= -0.1).all() and (decoded[..., 1] <= 1.1).all()
 
     def test_decode_predictions_gradient_flow(self):
         """Test that gradients flow through decoding."""
         raw_preds = torch.randn(1, 20, 20, 3, 6, requires_grad=True)
         anchors = torch.tensor([[10, 13], [16, 30], [33, 23]], dtype=torch.float32)
 
-        decoded = decode_predictions(raw_preds, anchors, grid_size=20, img_size=640)
+        decoded = decode_predictions(raw_preds, anchors, img_size=640)
 
         # Take mean and backward
         loss = decoded[..., :4].mean()

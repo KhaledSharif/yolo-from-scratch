@@ -11,6 +11,7 @@ import numpy as np
 import glob
 from datetime import datetime
 
+
 def letterbox_resize(image, target_size=640, pad_color=(114, 114, 114)):
     """
     Resize image with aspect ratio preservation (letterbox).
@@ -135,7 +136,7 @@ class YOLODataset(Dataset):
 
         # Load all boxes from label file
         if Path(self.labels[idx]).exists():
-            with open(self.labels[idx]) as f:
+            with open(self.labels[idx], encoding='utf-8') as f:
                 for line in f:
                     parts = line.strip().split()
                     if len(parts) == 5:
@@ -322,10 +323,28 @@ class YOLO(nn.Module):
     This approach constrains predictions to be near their responsible grid cell
     and scales dimensions relative to anchor size, improving training stability.
     """
-    def __init__(self, num_classes=1, anchors=None, img_size=640):
+    def __init__(self, num_classes=1, anchors=None, img_size=640,
+                 width_mult=0.50, depth_mult=0.33):  # Default to 's' model
         super().__init__()
         self.num_classes = num_classes
         self.img_size = img_size
+        self.width_mult = width_mult  # Store for checkpoint
+        self.depth_mult = depth_mult  # Store for checkpoint
+
+        # --- Helper functions for scaling ---
+        def make_divisible(x, divisor=8):
+            """Ensures channel counts are multiples of 8 for GPU efficiency."""
+            return int(np.ceil(x * width_mult / divisor) * divisor)
+
+        def make_repeats(n):
+            """Calculates number of C3 block repeats based on depth_mult."""
+            return max(round(n * depth_mult), 1) if n > 1 else n
+
+        # --- Scalable Channel Counts ---
+        c_stem = make_divisible(64)   # Stem output: 64 base
+        c3_p3 = make_divisible(128)   # P3: 128 base
+        c3_p4 = make_divisible(256)   # P4: 256 base
+        c3_p5 = make_divisible(512)   # P5: 512 base
 
         # Grid sizes for three scales
         self.grid_size_p3 = img_size // 8   # Stride 8 (e.g., 640 -> 80)
@@ -357,74 +376,73 @@ class YOLO(nn.Module):
         # Output channels per detection head: num_anchors * (5 + num_classes)
         self.output_channels = self.num_anchors * (5 + num_classes)
 
-        # ===== BACKBONE =====
-        # Layer 1: 3 -> 32, stride 2
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.SiLU()
+        # ===== BACKBONE (Scalable CSPDarknet) =====
+        # Stem: 3 -> 32 -> 64 (with scaling)
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, c_stem // 2, 3, 2, 1), nn.BatchNorm2d(c_stem // 2), nn.SiLU(),
+            nn.Conv2d(c_stem // 2, c_stem, 3, 2, 1), nn.BatchNorm2d(c_stem), nn.SiLU()
         )
-        # Layer 2: 32 -> 64, stride 2
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, 2, 1), nn.BatchNorm2d(64), nn.SiLU()
+        # P3 backbone: stride 4 -> stride 8 (128 channels base)
+        self.backbone_p3 = nn.Sequential(
+            C3(c_stem, c_stem, n=make_repeats(1)),
+            nn.Conv2d(c_stem, c3_p3, 3, 2, 1), nn.BatchNorm2d(c3_p3), nn.SiLU(),
+            C3(c3_p3, c3_p3, n=make_repeats(2))
         )
-        # Layer 3: 64 -> 128, stride 2 (total stride 8) -> P3
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 2, 1), nn.BatchNorm2d(128), nn.SiLU()
+        # P4 backbone: stride 8 -> stride 16 (256 channels base)
+        self.backbone_p4 = nn.Sequential(
+            nn.Conv2d(c3_p3, c3_p4, 3, 2, 1), nn.BatchNorm2d(c3_p4), nn.SiLU(),
+            C3(c3_p4, c3_p4, n=make_repeats(2))
         )
-        # Layer 4: 128 -> 256, stride 2 (total stride 16) -> P4
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 2, 1), nn.BatchNorm2d(256), nn.SiLU()
+        # P5 backbone: stride 16 -> stride 32 (512 channels base)
+        self.backbone_p5 = nn.Sequential(
+            nn.Conv2d(c3_p4, c3_p5, 3, 2, 1), nn.BatchNorm2d(c3_p5), nn.SiLU(),
+            C3(c3_p5, c3_p5, n=make_repeats(1))
         )
-        # Layer 5: 256 -> 512, stride 2 (total stride 32) -> P5
-        self.conv5 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, 2, 1), nn.BatchNorm2d(512), nn.SiLU()
-        )
-
         # SPPF on P5
-        self.sppf = SPPF(512, 512)
+        self.sppf = SPPF(c3_p5, c3_p5)
 
         # ===== FPN NECK (Top-Down) =====
-        # Lateral connections (reduce channels if needed)
-        self.lateral_p4 = ConvBlock(256, 256, 1, 1, 0)  # P4 lateral
-        self.lateral_p3 = ConvBlock(128, 128, 1, 1, 0)  # P3 lateral
+        # Lateral connections
+        self.lateral_p4 = ConvBlock(c3_p4, c3_p4, 1, 1, 0)
+        self.lateral_p3 = ConvBlock(c3_p3, c3_p3, 1, 1, 0)
 
         # Top-down pathway
         # P5 -> P4: Upsample + merge
         self.upsample_p5_to_p4 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.reduce_p5_for_p4 = ConvBlock(512, 256, 1, 1, 0)  # Match P4 channels
-        self.merge_p4 = C3(512, 256, n=1)  # After concat(P5_up, P4) = 512 channels
+        self.reduce_p5_for_p4 = ConvBlock(c3_p5, c3_p4, 1, 1, 0)
+        self.merge_p4 = C3(c3_p4 * 2, c3_p4, n=make_repeats(1))
 
         # P4 -> P3: Upsample + merge
         self.upsample_p4_to_p3 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.reduce_p4_for_p3 = ConvBlock(256, 128, 1, 1, 0)  # Match P3 channels
-        self.merge_p3 = C3(256, 128, n=1)  # After concat(P4_up, P3) = 256 channels
+        self.reduce_p4_for_p3 = ConvBlock(c3_p4, c3_p3, 1, 1, 0)
+        self.merge_p3 = C3(c3_p3 * 2, c3_p3, n=make_repeats(1))
 
         # ===== PANet (Bottom-Up) =====
         # P3 -> P4: Downsample + merge
-        self.downsample_p3_to_p4 = ConvBlock(128, 128, 3, 2, 1)  # Stride 2
-        self.panet_merge_p4 = C3(384, 256, n=1)  # After concat(P3_down, P4) = 128+256 = 384
+        self.downsample_p3_to_p4 = ConvBlock(c3_p3, c3_p3, 3, 2, 1)
+        self.panet_merge_p4 = C3(c3_p3 + c3_p4, c3_p4, n=make_repeats(1))
 
         # P4 -> P5: Downsample + merge
-        self.downsample_p4_to_p5 = ConvBlock(256, 256, 3, 2, 1)  # Stride 2
-        self.panet_merge_p5 = C3(768, 512, n=1)  # After concat(P4_down, P5) = 256+512 = 768
+        self.downsample_p4_to_p5 = ConvBlock(c3_p4, c3_p4, 3, 2, 1)
+        self.panet_merge_p5 = C3(c3_p4 + c3_p5, c3_p5, n=make_repeats(1))
 
         # ===== DETECTION HEADS =====
         # Stronger heads with 2 Conv blocks before final prediction (YOLOv5 style)
-        # This gives more capacity for feature refinement before detection
         self.head_p3 = nn.Sequential(
-            ConvBlock(128, 128, 3, 1, 1),  # 3×3 conv
-            ConvBlock(128, 128, 3, 1, 1),  # 3×3 conv
-            nn.Conv2d(128, self.output_channels, 1)  # Final 1×1 prediction
-        )  # Stride 8
+            ConvBlock(c3_p3, c3_p3, 3, 1, 1),
+            ConvBlock(c3_p3, c3_p3, 3, 1, 1),
+            nn.Conv2d(c3_p3, self.output_channels, 1)
+        )
         self.head_p4 = nn.Sequential(
-            ConvBlock(256, 256, 3, 1, 1),  # 3×3 conv
-            ConvBlock(256, 256, 3, 1, 1),  # 3×3 conv
-            nn.Conv2d(256, self.output_channels, 1)  # Final 1×1 prediction
-        )  # Stride 16
+            ConvBlock(c3_p4, c3_p4, 3, 1, 1),
+            ConvBlock(c3_p4, c3_p4, 3, 1, 1),
+            nn.Conv2d(c3_p4, self.output_channels, 1)
+        )
         self.head_p5 = nn.Sequential(
-            ConvBlock(512, 512, 3, 1, 1),  # 3×3 conv
-            ConvBlock(512, 512, 3, 1, 1),  # 3×3 conv
-            nn.Conv2d(512, self.output_channels, 1)  # Final 1×1 prediction
-        )  # Stride 32
+            ConvBlock(c3_p5, c3_p5, 3, 1, 1),
+            ConvBlock(c3_p5, c3_p5, 3, 1, 1),
+            nn.Conv2d(c3_p5, self.output_channels, 1)
+        )
 
         # Initialize detection head biases for training stability
         self.initialize_detection_biases()
@@ -476,12 +494,11 @@ class YOLO(nn.Module):
         batch_size = x.shape[0]
 
         # ===== BACKBONE: Extract multi-scale features =====
-        c1 = self.conv1(x)      # (B, 32, H/2, W/2)
-        c2 = self.conv2(c1)     # (B, 64, H/4, W/4)
-        p3_backbone = self.conv3(c2)   # (B, 128, H/8, W/8) - stride 8
-        p4_backbone = self.conv4(p3_backbone)  # (B, 256, H/16, W/16) - stride 16
-        p5_backbone = self.conv5(p4_backbone)  # (B, 512, H/32, W/32) - stride 32
-        p5_backbone = self.sppf(p5_backbone)   # (B, 512, H/32, W/32) with SPPF
+        x_stem = self.stem(x)                       # (B, c_stem, H/4, W/4)
+        p3_backbone = self.backbone_p3(x_stem)      # (B, c3_p3, H/8, W/8) - stride 8
+        p4_backbone = self.backbone_p4(p3_backbone) # (B, c3_p4, H/16, W/16) - stride 16
+        p5_backbone = self.backbone_p5(p4_backbone) # (B, c3_p5, H/32, W/32) - stride 32
+        p5_backbone = self.sppf(p5_backbone)        # (B, c3_p5, H/32, W/32) with SPPF
 
         # ===== FPN: Top-down pathway =====
         # Lateral connections
@@ -542,8 +559,10 @@ def ciou_loss(pred_boxes, target_boxes, eps=1e-7):
         CIoU loss value
     """
     # Extract coordinates
-    pred_x, pred_y, pred_w, pred_h = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
-    target_x, target_y, target_w, target_h = target_boxes[:, 0], target_boxes[:, 1], target_boxes[:, 2], target_boxes[:, 3]
+    pred_x, pred_y = pred_boxes[:, 0], pred_boxes[:, 1]
+    pred_w, pred_h = pred_boxes[:, 2], pred_boxes[:, 3]
+    target_x, target_y = target_boxes[:, 0], target_boxes[:, 1]
+    target_w, target_h = target_boxes[:, 2], target_boxes[:, 3]
 
     # Convert to corner format
     pred_x1 = pred_x - pred_w / 2
@@ -606,7 +625,7 @@ def ciou_loss(pred_boxes, target_boxes, eps=1e-7):
 
     return loss.mean()
 
-def decode_predictions(raw_preds, anchors, grid_size=None, img_size=640):
+def decode_predictions(raw_preds, anchors, img_size=640):
     """
     Decode raw YOLO predictions from offset format to absolute coordinates.
 
@@ -622,7 +641,6 @@ def decode_predictions(raw_preds, anchors, grid_size=None, img_size=640):
         raw_preds: (batch, grid_h, grid_w, num_anchors, 5+nc)
                    Raw network outputs where first 4 values are t_x, t_y, t_w, t_h
         anchors: (num_anchors, 2) tensor of anchor dimensions [width, height] in pixels
-        grid_size: DEPRECATED - grid size now always derived from tensor shape
         img_size: Input image size in pixels (default 640)
 
     Returns:
@@ -763,7 +781,7 @@ def yolo_loss_multiscale(predictions, targets, anchors_list, num_classes=1):
 
     # Compute loss for each scale with appropriate objectness weighting
     for pred, target, anchors, obj_weight in zip(predictions, targets, anchors_list, obj_weights):
-        loss, bbox_loss, obj_loss, class_loss = yolo_loss(pred, target, anchors, num_classes)
+        _, bbox_loss, obj_loss, class_loss = yolo_loss(pred, target, anchors, num_classes)
 
         # Apply per-scale objectness weighting
         # Decompose total loss: total_loss = 5.0*bbox + 1.0*obj + 1.0*cls
@@ -880,9 +898,7 @@ def eval_epoch(model, loader, device, num_classes=1, iou_threshold=0.5, conf_thr
             total_loss += loss.item()
 
             # Evaluate predictions from all three scales
-            for scale_idx, (pred, target, anchors, grid_size) in enumerate(
-                zip(preds, targets_batch, anchors_list, grid_sizes)
-            ):
+            for pred, target, anchors, grid_size in zip(preds, targets_batch, anchors_list, grid_sizes):
                 # Decode predictions from offset format to absolute coordinates
                 preds_decoded = decode_predictions(pred, anchors)
 
@@ -1041,9 +1057,9 @@ def predict(model, image_path, device, num_classes=1, conf_threshold=0.5, iou_th
     detections = []
 
     # Process each scale separately
-    for scale_idx, (pred, anchors, grid_size) in enumerate(zip(preds, anchors_list, grid_sizes)):
+    for pred, anchors, grid_size in zip(preds, anchors_list, grid_sizes):
         # Decode predictions from offset format to absolute coordinates
-        preds_decoded = decode_predictions(pred, anchors, grid_size, img_size)
+        preds_decoded = decode_predictions(pred, anchors, img_size)
 
         # Apply sigmoid to objectness and class predictions
         preds_decoded[..., 4] = torch.sigmoid(pred[..., 4])
@@ -1124,7 +1140,6 @@ def compute_optimal_anchors(dataset_yaml, img_size=640, num_anchors=9):
         List of 3 anchor sets: [anchors_p3, anchors_p4, anchors_p5]
         Each anchor set contains 3 anchors as [[w1, h1], [w2, h2], [w3, h3]]
     """
-    # Import sklearn for k-means
     try:
         from sklearn.cluster import KMeans
     except ImportError:
@@ -1133,7 +1148,7 @@ def compute_optimal_anchors(dataset_yaml, img_size=640, num_anchors=9):
         return None
 
     # Load dataset configuration
-    with open(dataset_yaml) as f:
+    with open(dataset_yaml, encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     # Collect all box dimensions from training set
@@ -1143,7 +1158,7 @@ def compute_optimal_anchors(dataset_yaml, img_size=640, num_anchors=9):
     all_boxes = []
     for label_file in label_files:
         if Path(label_file).exists():
-            with open(label_file) as f:
+            with open(label_file, encoding='utf-8') as f:
                 for line in f:
                     parts = line.strip().split()
                     if len(parts) == 5:
@@ -1199,18 +1214,30 @@ def compute_optimal_anchors(dataset_yaml, img_size=640, num_anchors=9):
 
     return [anchors_p3, anchors_p4, anchors_p5]
 
+# YOLOv5 model size variants
+YOLO_SIZES = {
+    'n': {'width_mult': 0.25, 'depth_mult': 0.33},  # Nano: ~1.9M params
+    's': {'width_mult': 0.50, 'depth_mult': 0.33},  # Small: ~7.2M params (default)
+    'm': {'width_mult': 0.75, 'depth_mult': 0.67},  # Medium: ~21.2M params
+    'l': {'width_mult': 1.00, 'depth_mult': 1.00},  # Large: ~46.5M params
+    'x': {'width_mult': 1.25, 'depth_mult': 1.33},  # XLarge: ~86.7M params
+}
+
 if __name__ == "__main__":
     import argparse
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='YOLO Training/Inference')
     parser.add_argument('files', nargs='*', help='YAML config, .pt model, or image file')
+    parser.add_argument('--size', type=str, default='s', choices=list(YOLO_SIZES.keys()),
+                        help='Model size: n(ano), s(mall), m(edium), l(arge), x(large) (default: s)')
     parser.add_argument('--img-size', type=int, default=640, help='Input image size (default: 640)')
     parser.add_argument('--lr', type=float, default=1e-2, help='Initial learning rate (default: 0.01)')
     parser.add_argument('--warmup-epochs', type=int, default=3, help='Number of warmup epochs (default: 3)')
     parser.add_argument('--min-lr', type=float, default=1e-4, help='Minimum learning rate (default: 0.0001)')
     parser.add_argument('--epochs', type=int, default=100, help='Total training epochs (default: 100)')
-    parser.add_argument('--compute-anchors', action='store_true', help='Compute optimal anchors for dataset using k-means')
+    parser.add_argument('--compute-anchors', action='store_true',
+                        help='Compute optimal anchors for dataset using k-means')
     parsed_args = parser.parse_args()
 
     # Extract file types from positional arguments
@@ -1235,23 +1262,36 @@ if __name__ == "__main__":
     num_classes = 1
     config = None
     if yaml_file:
-        with open(yaml_file) as f:
+        with open(yaml_file, encoding='utf-8') as f:
             config = yaml.safe_load(f)
         num_classes = config.get('nc', 1)
 
-    # Create model with appropriate num_classes and img_size
-    model = YOLO(num_classes=num_classes, img_size=img_size).to(device)
+    # Get model size configuration
+    size_config = YOLO_SIZES[parsed_args.size]
+    width_mult = size_config['width_mult']
+    depth_mult = size_config['depth_mult']
+
+    # Create model with appropriate num_classes, img_size, and size multipliers
+    print(f"Creating YOLOv5{parsed_args.size.upper()} "
+          f"(width={width_mult}, depth={depth_mult})")
+    model = YOLO(num_classes=num_classes, img_size=img_size,
+                 width_mult=width_mult, depth_mult=depth_mult).to(device)
 
     if pt_file and not yaml_file and not image_file:
         # Inspect mode: python train.py model.pt
         checkpoint = torch.load(pt_file, map_location=device)
-        # Use saved img_size if available, otherwise use CLI arg
-        if 'img_size' in checkpoint:
-            model = YOLO(num_classes=num_classes, img_size=checkpoint['img_size']).to(device)
+        # Use saved img_size and multipliers if available, otherwise use defaults
+        img_size_ckpt = checkpoint.get('img_size', img_size)
+        width_mult_ckpt = checkpoint.get('width_mult', 0.5)  # Default to 's'
+        depth_mult_ckpt = checkpoint.get('depth_mult', 0.33)
+        model = YOLO(num_classes=num_classes, img_size=img_size_ckpt,
+                     width_mult=width_mult_ckpt, depth_mult=depth_mult_ckpt).to(device)
         model.load_state_dict(checkpoint['model'])
         print(f"Model loaded from {pt_file}")
         print(f"Number of classes: {num_classes}")
         print(f"Image size: {model.img_size}")
+        print(f"Width multiplier: {model.width_mult}")
+        print(f"Depth multiplier: {model.depth_mult}")
         print("\nModel architecture:")
         for name, param in model.named_parameters():
             print(f"  {name}: {list(param.shape)}, {param.numel()} parameters")
@@ -1261,9 +1301,12 @@ if __name__ == "__main__":
     elif image_file and pt_file:
         # Inference mode: python train.py image.jpg model.pt
         checkpoint = torch.load(pt_file, map_location=device)
-        # Use saved img_size if available, otherwise use CLI arg
-        if 'img_size' in checkpoint:
-            model = YOLO(num_classes=num_classes, img_size=checkpoint['img_size']).to(device)
+        # Use saved img_size and multipliers if available
+        img_size_ckpt = checkpoint.get('img_size', img_size)
+        width_mult_ckpt = checkpoint.get('width_mult', 0.5)
+        depth_mult_ckpt = checkpoint.get('depth_mult', 0.33)
+        model = YOLO(num_classes=num_classes, img_size=img_size_ckpt,
+                     width_mult=width_mult_ckpt, depth_mult=depth_mult_ckpt).to(device)
         model.load_state_dict(checkpoint['model'])
         print(f"Running inference on {image_file}")
         print(f"Model: {pt_file}, Classes: {num_classes}, Image size: {model.img_size}")
@@ -1283,14 +1326,18 @@ if __name__ == "__main__":
         if pt_file:
             # Eval mode: python train.py data.yaml model.pt
             checkpoint = torch.load(pt_file, map_location=device)
-            # Use saved img_size if available, otherwise use CLI arg
-            if 'img_size' in checkpoint:
-                img_size = checkpoint['img_size']
-                model = YOLO(num_classes=num_classes, img_size=img_size).to(device)
+            # Use saved img_size and multipliers if available
+            img_size = checkpoint.get('img_size', img_size)
+            width_mult_ckpt = checkpoint.get('width_mult', 0.5)
+            depth_mult_ckpt = checkpoint.get('depth_mult', 0.33)
+            model = YOLO(num_classes=num_classes, img_size=img_size,
+                         width_mult=width_mult_ckpt, depth_mult=depth_mult_ckpt).to(device)
             model.load_state_dict(checkpoint['model'])
             print(f"Evaluating model from {pt_file}")
             print(f"Number of classes: {num_classes}")
             print(f"Image size: {model.img_size}")
+            print(f"Width multiplier: {model.width_mult}")
+            print(f"Depth multiplier: {model.depth_mult}")
 
         # Create dataloaders with correct img_size and custom collate function
         train_loader = DataLoader(YOLODataset(config['train'], num_classes=num_classes, img_size=img_size),
@@ -1303,25 +1350,25 @@ if __name__ == "__main__":
             train_loss, train_prec, train_rec, train_f1 = eval_epoch(model, train_loader, device, num_classes)
             val_loss, val_prec, val_rec, val_f1 = eval_epoch(model, val_loader, device, num_classes)
 
-            print(f"\nTraining Set:")
+            print("\nTraining Set:")
             print(f"  Loss: {train_loss:.4f}")
             print(f"  Precision: {train_prec:.2f}%")
             print(f"  Recall: {train_rec:.2f}%")
             print(f"  F1 Score: {train_f1:.2f}%")
 
-            print(f"\nValidation Set:")
+            print("\nValidation Set:")
             print(f"  Loss: {val_loss:.4f}")
             print(f"  Precision: {val_prec:.2f}%")
             print(f"  Recall: {val_rec:.2f}%")
             print(f"  F1 Score: {val_f1:.2f}%")
         else:
             # Train mode: python train.py data.yaml
-            print(f"Training YOLO model")
+            print("Training YOLO model")
             print(f"Number of classes: {num_classes}")
             print(f"Training images: {len(train_loader.dataset)}")
             print(f"Validation images: {len(val_loader.dataset)}")
             print(f"Device: {device}")
-            print(f"\nLearning Rate Schedule:")
+            print("\nLearning Rate Schedule:")
             print(f"  Initial LR: {parsed_args.lr}")
             print(f"  Minimum LR: {parsed_args.min_lr}")
             print(f"  Warmup epochs: {parsed_args.warmup_epochs}")
@@ -1343,7 +1390,8 @@ if __name__ == "__main__":
             save_path = f"yolo_{timestamp}.pt"
 
             for epoch in tqdm(range(parsed_args.epochs), desc="Training"):
-                train_loss, bbox_loss, obj_loss, cls_loss = train_epoch(model, train_loader, optimizer, device, num_classes)
+                train_loss, bbox_loss, obj_loss, cls_loss = train_epoch(
+                    model, train_loader, optimizer, device, num_classes)
                 val_loss, val_prec, val_rec, val_f1 = eval_epoch(model, val_loader, device, num_classes)
 
                 # Get current learning rate
@@ -1354,7 +1402,14 @@ if __name__ == "__main__":
                           f"Val: Loss {val_loss:.4f}, P {val_prec:.1f}%, R {val_rec:.1f}%, F1 {val_f1:.1f}% | "
                           f"LR: {current_lr:.6f}")
 
-                torch.save({'model': model.state_dict(), 'epoch': epoch, 'num_classes': num_classes, 'img_size': img_size}, save_path)
+                torch.save({
+                    'model': model.state_dict(),
+                    'epoch': epoch,
+                    'num_classes': num_classes,
+                    'img_size': img_size,
+                    'width_mult': model.width_mult,
+                    'depth_mult': model.depth_mult
+                }, save_path)
 
                 # Update learning rate
                 scheduler.step()
@@ -1362,13 +1417,16 @@ if __name__ == "__main__":
             print(f"\nTraining complete. Model saved to {save_path}")
     else:
         print("Usage:")
-        print("  Training:       python train.py data.yaml [OPTIONS]")
-        print("  Evaluation:     python train.py data.yaml model.pt [--img-size SIZE]")
-        print("  Inference:      python train.py image.jpg model.pt [--img-size SIZE]")
-        print("  Inspect:        python train.py model.pt")
+        print("  Training:        python train.py data.yaml [OPTIONS]")
+        print("  Evaluation:      python train.py data.yaml model.pt [--img-size SIZE]")
+        print("  Inference:       python train.py image.jpg model.pt [--img-size SIZE]")
+        print("  Inspect:         python train.py model.pt")
         print("  Compute Anchors: python train.py data.yaml --compute-anchors [--img-size SIZE]")
         print("")
         print("Options:")
+        print("  --size {n,s,m,l,x}     Model size variant (default: s)")
+        print("                         n=nano (~1.9M), s=small (~7.2M), m=medium (~21M),")
+        print("                         l=large (~47M), x=xlarge (~87M) parameters")
         print("  --img-size SIZE        Input image size (default: 640)")
         print("                         Must be divisible by 32 (e.g., 416, 512, 640, 1280)")
         print("  --lr LR                Initial learning rate (default: 0.01)")

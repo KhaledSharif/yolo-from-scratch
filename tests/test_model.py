@@ -222,3 +222,25 @@ class TestYOLOModel:
         assert outputs[0].shape == (16, 80, 80, 3, 6)
         assert outputs[1].shape == (16, 40, 40, 3, 6)
         assert outputs[2].shape == (16, 20, 20, 3, 6)
+
+    def test_initialize_biases_with_none(self, capsys):
+        """Test bias initialization handles None bias (lines 543-544)."""
+        import torch.nn as nn
+
+        model = YOLO(num_classes=1, img_size=640)
+
+        # Manually set one detection head's bias to None to trigger warning
+        # Detection heads are nn.Sequential, last layer is Conv2d
+        model.head_p3[-1].bias = None
+
+        # Now call initialize_detection_biases - should create bias and print warning
+        model.initialize_detection_biases()
+
+        # Capture stdout to verify warning was printed
+        captured = capsys.readouterr()
+        assert "Warning: Detection head bias was None" in captured.out
+
+        # Verify bias was created
+        assert model.head_p3[-1].bias is not None
+        assert isinstance(model.head_p3[-1].bias, nn.Parameter)
+        assert model.head_p3[-1].bias.shape == (model.output_channels,)

@@ -150,6 +150,40 @@ Loss computed independently for each scale, then summed:
 - Increased compute from FPN/PANet feature fusion
 - Significantly better accuracy, especially for small objects
 
+## Testing
+
+The project includes comprehensive unit tests covering all major components.
+
+### Running Tests
+
+```bash
+# Run all tests
+python3 -m pytest tests
+
+# Run tests with coverage report
+python3 -m pytest tests --cov=train --cov-report=term
+
+# Show which lines are missing coverage
+python3 -m pytest tests --cov=train --cov-report=term-missing
+
+# Generate HTML coverage report (opens in browser)
+python3 -m pytest tests --cov=train --cov-report=html
+# Then open htmlcov/index.html
+
+# Multiple reports at once
+python3 -m pytest tests --cov=train --cov-report=term --cov-report=html
+```
+
+**Test Coverage:**
+The test suite includes 81 tests covering:
+- **Dataset loading** (`tests/test_dataset.py`): Multi-scale target generation, anchor matching, collate function
+- **Model architecture** (`tests/test_model.py`): Forward pass, feature map shapes, parameter counts
+- **Loss functions** (`tests/test_loss.py`): CIoU calculation, multi-scale loss computation, gradient flow
+- **Inference** (`tests/test_inference.py`): Prediction decoding, NMS, coordinate transformations
+- **Utilities** (`tests/test_utils.py`): Helper functions, metrics computation
+
+**Important**: Use `--cov=train` (not `--cov=main`) since the main code is in `train.py`.
+
 ## Commands
 
 ### Training

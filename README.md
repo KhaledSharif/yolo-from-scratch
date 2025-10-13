@@ -20,6 +20,9 @@ A YOLOv5-inspired PyTorch implementation of YOLO (You Only Look Once) object det
 
 ```bash
 pip install torch torchvision pillow opencv-python numpy pyyaml tqdm
+
+# For testing (optional)
+pip install pytest pytest-cov
 ```
 
 Tested with Python 3.8+ and PyTorch 1.10+.
@@ -142,6 +145,36 @@ Visualize predictions vs. ground truth:
 - **Arrow keys / A / D**: Navigate images
 - **S**: Save screenshot
 - **Q / ESC**: Quit
+
+## Testing
+
+The project includes 81 comprehensive unit tests covering all major components.
+
+### Running Tests
+
+```bash
+# Run all tests
+python3 -m pytest tests
+
+# Run tests with coverage report
+python3 -m pytest tests --cov=train --cov-report=term
+
+# Show which lines are missing coverage
+python3 -m pytest tests --cov=train --cov-report=term-missing
+
+# Generate HTML coverage report
+python3 -m pytest tests --cov=train --cov-report=html
+# Then open htmlcov/index.html in your browser
+```
+
+**Test Coverage Areas:**
+- **Dataset loading**: Multi-scale target generation, anchor matching, collate function
+- **Model architecture**: Forward pass, feature map shapes, parameter counts
+- **Loss functions**: CIoU calculation, multi-scale loss computation, gradient flow
+- **Inference**: Prediction decoding, NMS, coordinate transformations
+- **Utilities**: Helper functions, metrics computation
+
+**Note**: Use `--cov=train` (not `--cov=main`) since the main code is in `train.py`.
 
 ## Architecture (YOLOv5-style FPN + PANet)
 

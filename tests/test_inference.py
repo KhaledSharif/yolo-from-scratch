@@ -197,3 +197,113 @@ class TestPredict:
 
         # Detections can come from any scale
         assert isinstance(detections, list)
+
+    def test_predict_multiclass(self, temp_dataset_dir, device):
+        """Test prediction with multiple classes (lines 1178-1183)."""
+        model = YOLO(num_classes=3, img_size=640)
+        model.eval()
+
+        from glob import glob
+        image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
+
+        # Use low confidence to get detections
+        detections = predict(model, image_path, device, num_classes=3, conf_threshold=0.3)
+
+        assert isinstance(detections, list)
+
+        # If detections exist, verify class_id is in valid range
+        if len(detections) > 0:
+            for det in detections:
+                x1, y1, x2, y2, conf, class_id = det
+                assert 0 <= class_id < 3, f"Class ID {class_id} out of range [0, 3)"
+                assert 0.0 <= conf <= 1.0
+
+    def test_predict_with_actual_detections(self, temp_dataset_dir, device):
+        """Test prediction when detections exist (lines 1221-1236)."""
+        model = YOLO(num_classes=1, img_size=640)
+        model.eval()
+
+        from glob import glob
+        image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
+
+        # Use very low confidence to ensure we get some detections
+        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.01)
+
+        # With very low threshold, should get at least some detections
+        # (even if they're false positives from untrained model)
+        # This covers the path when len(all_boxes) > 0 and NMS is applied
+        if len(detections) > 0:
+            # Verify detection format
+            for det in detections:
+                assert len(det) == 6
+                x1, y1, x2, y2, conf, class_id = det
+                # Coordinates can be negative due to letterbox transform
+                # Just verify they're not absurdly large
+                assert abs(x1) < 10000 and abs(y1) < 10000
+                assert x2 > x1 and y2 > y1
+                assert 0.0 < conf <= 1.0
+                assert class_id == 0  # Single class
+
+            # Verify NMS was applied (no high-overlap boxes)
+            for i in range(len(detections)):
+                for j in range(i + 1, len(detections)):
+                    iou = compute_iou_corners(detections[i], detections[j])
+                    assert iou < 0.4, "NMS should remove overlapping boxes"
+
+    def test_predict_empty_detections(self, temp_dataset_dir, device):
+        """Test prediction when no detections are found."""
+        model = YOLO(num_classes=1, img_size=640)
+        model.eval()
+
+        from glob import glob
+        image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
+
+        # Use extremely high confidence threshold - should get no detections
+        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.9999)
+
+        # Should return empty list, not error
+        assert isinstance(detections, list)
+        assert len(detections) == 0
+
+    def test_predict_nms_multiclass(self, temp_dataset_dir, device):
+        """Test that batched_nms handles multiple classes correctly."""
+        model = YOLO(num_classes=3, img_size=640)
+        model.eval()
+
+        from glob import glob
+        image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
+
+        # Get detections with multiple classes
+        detections = predict(model, image_path, device, num_classes=3, conf_threshold=0.1, iou_threshold=0.4)
+
+        # Should use batched_nms which handles multi-class
+        assert isinstance(detections, list)
+
+        # Verify all detections have valid class IDs
+        for det in detections:
+            _, _, _, _, conf, class_id = det
+            assert 0 <= class_id < 3
+            assert 0.0 < conf <= 1.0
+
+    def test_predict_letterbox_resize(self, temp_dataset_dir, device):
+        """Test that predict handles letterbox resize correctly."""
+        model = YOLO(num_classes=1, img_size=640)
+        model.eval()
+
+        from glob import glob
+        image_path = glob(f"{temp_dataset_dir}/*.jpg")[0]
+
+        # Run prediction (letterbox resize happens internally)
+        detections = predict(model, image_path, device, num_classes=1, conf_threshold=0.3)
+
+        # Coordinates should be in original image space (after reversing letterbox)
+        assert isinstance(detections, list)
+
+        # If detections exist, coordinates should be reasonable
+        if len(detections) > 0:
+            for det in detections:
+                x1, y1, x2, y2, _, _ = det
+                # Coordinates might be outside [0, img_size] due to letterbox reverse transform
+                # Just verify they're not extremely large
+                assert abs(x1) < 10000 and abs(y1) < 10000
+                assert abs(x2) < 10000 and abs(y2) < 10000

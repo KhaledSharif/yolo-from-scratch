@@ -106,6 +106,31 @@ class TestYOLODataset:
             assert targets[1].shape[0] == size // 16  # P4 grid size
             assert targets[2].shape[0] == size // 32  # P5 grid size
 
+    def test_backward_compat_single_anchor_set(self, temp_dataset_dir):
+        """Test backward compatibility with single (non-nested) anchor set."""
+        # Pass single anchor set (not list of lists) - triggers else branch at line 93-95
+        single_anchors = [[10, 13], [16, 30], [33, 23]]
+        dataset = YOLODataset(temp_dataset_dir, num_classes=1, anchors=single_anchors, img_size=640)
+
+        # Should replicate anchors across all 3 scales
+        assert len(dataset.anchors) == 3
+        expected_tensor = torch.tensor(single_anchors, dtype=torch.float32)
+        for i in range(3):
+            assert torch.allclose(dataset.anchors[i], expected_tensor), \
+                f"Scale P{i+3} anchors don't match expected"
+
+    def test_backward_compat_tensor_anchors(self, temp_dataset_dir):
+        """Test backward compatibility with tensor anchors."""
+        # Pass anchors as already converted tensors (edge case)
+        single_anchors = torch.tensor([[15, 20], [25, 35], [45, 50]], dtype=torch.float32)
+        dataset = YOLODataset(temp_dataset_dir, num_classes=1, anchors=single_anchors, img_size=640)
+
+        # Should still replicate across scales
+        assert len(dataset.anchors) == 3
+        for i in range(3):
+            assert torch.allclose(dataset.anchors[i], single_anchors), \
+                f"Scale P{i+3} tensor anchors don't match"
+
 
 class TestCollateFn:
     """Test custom collate function."""

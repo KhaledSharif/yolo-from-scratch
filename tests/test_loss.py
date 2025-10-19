@@ -124,8 +124,8 @@ class TestYOLOLoss:
             predictions, targets, anchors, num_classes
         )
 
-        # Total loss = 5*bbox + 1*obj + 1*class
-        expected = 5.0 * bbox_loss + 1.0 * obj_loss + 1.0 * class_loss
+        # Total loss = 0.05*bbox + 1.0*obj + 0.5*class (YOLOv5 defaults)
+        expected = 0.05 * bbox_loss + 1.0 * obj_loss + 0.5 * class_loss
         assert torch.allclose(total_loss, expected, atol=1e-5)
 
 

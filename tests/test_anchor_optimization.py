@@ -77,17 +77,6 @@ class TestComputeOptimalAnchors:
         areas = [w * h for w, h in all_anchors]
         assert areas == sorted(areas), "Anchors should be sorted by area"
 
-    @pytest.mark.skip(reason="Mocking import errors for function-level imports is complex and error-prone")
-    def test_compute_optimal_anchors_no_sklearn(self, temp_anchor_dataset):
-        """Test error handling when sklearn is not available (lines 1263-1268).
-
-        Note: This test is skipped because properly mocking ImportError for imports
-        that happen inside a function scope is complex and fragile. The error handling
-        path (lines 1265-1268) is straightforward and returns None + prints error,
-        which can be manually verified if needed.
-        """
-        pass
-
     def test_compute_optimal_anchors_no_boxes(self):
         """Test error handling when no boxes found (lines 1293-1295)."""
         with tempfile.TemporaryDirectory() as tmpdir:

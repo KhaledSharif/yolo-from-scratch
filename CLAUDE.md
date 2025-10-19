@@ -101,9 +101,14 @@ Loss computed independently for each scale, then summed:
 **Per-scale loss:**
 1. **Bounding box regression:** CIoU (Complete IoU) loss
    - Considers IoU + center distance penalty + aspect ratio consistency
-   - Applied only to cells with objects, weighted 5×
+   - Applied only to cells with objects
 2. **Objectness:** Binary cross-entropy with logits (all cells)
 3. **Classification:** Binary cross-entropy with logits (cells with objects only)
+
+**Loss component weights (YOLOv5 defaults from hyp.scratch-low.yaml):**
+- box: 0.05 (bbox loss gain)
+- obj: 1.0 (objectness loss gain, with per-scale balancing [4.0, 1.0, 0.4])
+- cls: 0.5 (classification loss gain)
 
 **Total loss:** `loss_P3 + loss_P4 + loss_P5`
 

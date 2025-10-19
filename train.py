@@ -831,8 +831,9 @@ def yolo_loss(predictions, targets, anchors, num_classes=1):
     else:
         class_loss = torch.tensor(0.0, device=predictions.device)
 
-    # Combined loss with weights (bbox weighted 5x higher)
-    total_loss = 5.0 * bbox_loss + 1.0 * obj_loss + 1.0 * class_loss
+    # YOLOv5 loss component weights (from hyp.scratch-low.yaml)
+    # box: 0.05, obj: 1.0, cls: 0.5
+    total_loss = 0.05 * bbox_loss + 1.0 * obj_loss + 0.5 * class_loss
 
     return total_loss, bbox_loss, obj_loss, class_loss
 
@@ -873,9 +874,9 @@ def yolo_loss_multiscale(predictions, targets, anchors_list, num_classes=1):
         _, bbox_loss, obj_loss, class_loss = yolo_loss(pred, target, anchors, num_classes)
 
         # Apply per-scale objectness weighting
-        # Decompose total loss: total_loss = 5.0*bbox + 1.0*obj + 1.0*cls
-        # Re-weight: total_loss = 5.0*bbox + obj_weight*obj + 1.0*cls
-        weighted_loss = 5.0 * bbox_loss + obj_weight * obj_loss + 1.0 * class_loss
+        # YOLOv5 loss weighting: box=0.05, obj=obj_weight (per-scale), cls=0.5
+        # Per-scale obj weights [4.0, 1.0, 0.4] balance gradient contributions
+        weighted_loss = 0.05 * bbox_loss + obj_weight * obj_loss + 0.5 * class_loss
 
         total_loss += weighted_loss
         total_bbox_loss += bbox_loss
